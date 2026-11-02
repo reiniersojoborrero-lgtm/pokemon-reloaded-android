@@ -1,4 +1,12 @@
+# MODO DE MANTENIMIENTO
+
+Esta aplicación dejara de actualizarse de forma constante y solo lo hará para solucionar bugs concretos o específicos, la aplicación en algún punto de finales de año dejara de recibir soporte de forma completa, este no es el fin, sino el inicio de un proyecto multiplataforma para Windows, Linux, macOS, Android y iOS de nombre **Reloaded OpenGMK** de paso anuncio que el código de Pokémon Reloaded Android queda totalmente limpio de cualquier derivado de scripts GML, pronto habrá mas noticias de **Reloaded OpenGMK**
+
 # Pokémon Reloaded en Android
+
+[![Licencia GPL-2.0](https://img.shields.io/badge/Licencia-GPL--2.0-515050?style=for-the-badge&logo=gnu&logoColor=000000&labelColor=FFFFFF)](LICENSE)
+[![Última versión](https://img.shields.io/github/v/release/Klisee/pokemon-reloaded-android?style=for-the-badge&label=Versi%C3%B3n&labelColor=FFFFFF&color=3DDC84&logo=android&logoColor=000000)](https://github.com/Klisee/pokemon-reloaded-android/releases/latest)
+[![Descargas totales](https://img.shields.io/github/downloads/Klisee/pokemon-reloaded-android/total?style=for-the-badge&label=Descargas&labelColor=FFFFFF&color=1F6FEB&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI%2BPHBhdGggZmlsbD0iIzAwMCIgZD0iTTUgMjBoMTR2LTJINXYyek0xOSA5aC00VjNIOXY2SDVsNyA3IDctN3oiLz48L3N2Zz4%3D)](https://github.com/Klisee/pokemon-reloaded-android/releases)
 
 Ejecuta **Pokémon Reloaded** en Android sin emulador de Windows de por medio. Lo mantiene
 [@Klisee](https://github.com/Klisee), para la comunidad.
@@ -31,6 +39,13 @@ ajustes, gestión de partidas y logs. El juego en sí no se toca.
 - **Partidas.** Se leen y escriben en la carpeta del juego. Desde Ajustes → Partidas puedes verlas,
   exportarlas, importarlas, borrarlas y mover una de una ranura a otra. Si jugabas en PC, tu partida
   entra por aquí.
+- **Frames.** En Ajustes → Frames, **30 FPS (Original)** es el modo por defecto. **60 FPS
+  (Experimental)** y **120 FPS (Experimental)** interpolan movimiento y cámara a esa tasa; la opción
+  de 120 solo se habilita si el panel anuncia 120 Hz o más. **FPS sin Límite** dibuja todo lo que
+  pueda el móvil y también requiere 120 Hz o más. La simulación sigue a 30 pasos/s: no va más rápido
+  el juego, y las animaciones de sprites y la lógica siguen a 30 Hz. Los modos experimentales gastan
+  más batería y pueden fallar. En escritorio se elige con `-R auto`, `-R 60`, `-R 120` o
+  `-R uncapped`, y `OPENGMK_RENDER_LOG=1` imprime los dibujos/s y los pasos/s reales.
 - **Salir y volver.** Al mandar la app a segundo plano, el bucle se detiene y el audio se corta de
   verdad; al volver, sigue donde estaba en vez de quedarse en negro.
 - **Logs.** Si algo va mal, la app escribe un log y lo puedes compartir como archivo de texto desde
@@ -81,33 +96,72 @@ El repo no incluye ningún asset del juego, y eso es justo lo que lo mantiene li
 Está en beta y se nota: puede petar. Si algo falla, guarda un log desde Ajustes → Logs y ábrelo como
 issue.
 
-Lo que ahora mismo da problemas, y resolvere despues:
+Ya resuelto:
 
-- **El escalado en combate.** El juego cambia la escala por su cuenta y la cámara se vuelve loca.
-- **El movimiento Vuelo.** En combate no llega a conectar y el Pokémon se queda cayendo.
+- **La pantalla negra en móviles con GPU PowerVR** (MediaTek Helio y similares). El motor enlazaba el
+  VAO/VBO/programa una sola vez y daba por anulado el búfer tras cada dibujo: en GPUs diferidas
+  (TBDR) eso dejaba al procesador de vértices leyendo memoria descartada y no se pintaba nada. Ahora
+  se enlazan en cada dibujo, no se invalida el búfer, el bloque de uniforms `std140` tiene los
+  offsets correctos y los atlases se suben por lotes — con esto último el arranque pasó de ~85 s a
+  un momento. Gracias a **Alexpix0 (Armando)**, que lo encontró y probó. (Los detalles del
+  diagnóstico están en el historial de commits.)
+- **El escalado en combate**, que se quedaba con la cámara descolocada.
+- **El movimiento Vuelo**, que no llegaba a conectar.
+- **La XP infinita** al abrir la mochila tras debilitar a un Pokémon.
+- **El cierre en combates dobles** al cambiar de Pokémon.
+
+Lo que ahora mismo da problemas, y resolveré después:
+
+- **El audio se corta** en algunos móviles al mezclar música y efectos.
 
 Y por ir haciendo, sin orden:
 
-- Pulir el escalado del combate hasta que se comporte.
+- Poner imágenes propias (pixel art) a más botones táctiles.
 - Más ajustes de rendimiento en móviles modestos.
 - Revisar la compatibilidad con mandos de todo tipo.
 
 ## Compilar
 
+Cada arquitectura lleva su propio APK (el motor es nativo). `arm64-v8a` es la de por defecto:
+
 ```
 # El motor (Rust) y su .so para Android
 cd src/OpenGMK
 cargo ndk -t arm64-v8a --platform 29 build -p gm8emulator --release
+cargo ndk -t armeabi-v7a --platform 29 build -p gm8emulator --release
+cargo ndk -t x86_64 --platform 29 build -p gm8emulator --release
 
-# La app
+# La app: un APK por arquitectura
 cd ../../android
 ./build.sh :app:assembleRelease
+./build.sh :app:assembleRelease -PtargetAbi=armeabi-v7a
+./build.sh :app:assembleRelease -PtargetAbi=x86_64
+./build.sh :app:assembleRelease -PtargetAbi=universal
 ```
+
+La **universal** lleva las tres arquitecturas y sirve de comodín, a costa de pesar unos 10 MB más.
+
+El workflow `.github/workflows/build-apks.yml` compila las tres en CI al publicar un tag.
+
+## Licencia
+
+Copyright (C) 2026 Klisee y colaboradores.
+
+Este proyecto se distribuye bajo la **GNU General Public License v2.0** (`GPL-2.0-only`), la misma
+licencia que OpenGMK, del que toma el motor. El texto completo está en [LICENSE](LICENSE).
+
+Los archivos originales de Pokémon Reloaded no forman parte de este repositorio ni se distribuyen
+con el APK; son obra de F3R Productions y se rigen por sus propios términos. `vendor/udon` también
+es GPL-2.0-only, y `vendor/ramen` se distribuye bajo licencia Zlib.
 
 ## Créditos
 
 - **Pokémon Reloaded** es obra de **F3R Productions**: [el blog del juego](https://pokemon-reloaded.blogspot.com/)
 - **OpenGMK**, la reimplementación del motor sin la que esto no existiría: [github.com/OpenGMK/OpenGMK](https://github.com/OpenGMK/OpenGMK)
+- **LixarXDX**: por el rediseño de los controles táctiles y los controles clásicos, la base de la personalización de esta versión.
+- **[Kizzy (dead8309)](https://github.com/dead8309/KizzyRPC)**: por KizzyRPC, el método en el que se basa el Rich Presence con token de usuario.
+- **[nyxthor-dev](https://github.com/nyxthor-dev)**: por el análisis del congelamiento al volver del segundo plano y las propuestas de corrección ([issue #77](https://github.com/Klisee/pokemon-reloaded-android/issues/77)).
+- **Alexpix0 (Armando)**: por el arreglo del renderizado que resolvió la **pantalla negra en móviles con GPU PowerVR** (enlazar VAO/VBO/programa en cada dibujo, quitar la invalidación del búfer que rompía en GPUs diferidas, corregir el `std140` del bloque de uniforms y subir los atlases por lotes, que además dejó el arranque muchísimo más rápido). [Su PR](https://github.com/Klisee/pokemon-reloaded-android/pull/2)
 - **Google Sans Flex**, la tipografía de la app
 
 Pokémon es una marca de Nintendo, Game Freak y Creatures. Este proyecto no está afiliado ni

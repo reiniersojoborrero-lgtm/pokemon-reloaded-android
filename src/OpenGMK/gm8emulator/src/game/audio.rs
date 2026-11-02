@@ -10,7 +10,7 @@ use std::{
     io::Write,
     process::{self, Child, Stdio},
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{self, Receiver, Sender},
         Arc,
     },
@@ -23,6 +23,11 @@ use udon::{
     source::{ChannelCount, Sample, SampleRate, Source},
     wav::WavPlayer,
 };
+
+#[cfg(target_os = "android")]
+pub fn sound_started() -> bool {
+    aaudio::sound_started()
+}
 
 pub use self::midi::MidiHandle;
 use self::{
@@ -50,6 +55,53 @@ pub struct SoundParams {
     pub volume: AtomicU32,
 }
 
+/// Parameters for the Game Boy-style lo-fi pass over the final mix.
+#[derive(Clone, Copy, Debug)]
+pub struct GbAudioSettings {
+    pub bits: u32,
+    /// Target sample rate of the sample-and-hold stage, in Hz.
+    pub sample_rate: u32,
+    pub mono: bool,
+}
+
+impl Default for GbAudioSettings {
+    fn default() -> Self {
+        Self { bits: 6, sample_rate: 8000, mono: true }
+    }
+}
+
+/// Thread-safe switch and settings read by the audio thread on every buffer.
+pub struct GbAudioParams {
+    enabled: AtomicBool,
+    bits: AtomicU32,
+    sample_rate: AtomicU32,
+    mono: AtomicBool,
+}
+
+impl Default for GbAudioParams {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            bits: AtomicU32::new(6),
+            sample_rate: AtomicU32::new(8000),
+            mono: AtomicBool::new(true),
+        }
+    }
+}
+
+impl GbAudioParams {
+    pub fn set(&self, settings: Option<GbAudioSettings>) {
+        if let Some(settings) = settings {
+            self.bits.store(settings.bits.clamp(4, 12), Ordering::Release);
+            self.sample_rate.store(settings.sample_rate.clamp(4000, 48000), Ordering::Release);
+            self.mono.store(settings.mono, Ordering::Release);
+            self.enabled.store(true, Ordering::Release);
+        } else {
+            self.enabled.store(false, Ordering::Release);
+        }
+    }
+}
+
 pub struct AudioManager {
     mixer: Option<Mixer>,
     sample_sender: Option<Sender<Sample>>,
@@ -58,6 +110,7 @@ pub struct AudioManager {
     mixer_sample_rate: SampleRate,
     do_output: bool,
     global_volume: Arc<AtomicU32>,
+    gb_audio: Arc<GbAudioParams>,
     end_times: HashMap<i32, Option<u128>>,
     multimedia_end: Option<(i32, Option<u128>)>,
     audio_recorder: Option<Child>,
@@ -105,6 +158,15 @@ fn session_api() -> Api {
     Api::SoundIo
 }
 
+impl Drop for AudioManager {
+    fn drop(&mut self) {
+        #[cfg(target_os = "android")]
+        if let Some(stream) = self.aaudio_stream.take() {
+            aaudio::close_stream(stream);
+        }
+    }
+}
+
 impl AudioManager {
     /// An audio manager that produces no output. Used on platforms without an audio backend yet.
     #[cfg(target_os = "android")]
@@ -117,6 +179,7 @@ impl AudioManager {
             mixer_sample_rate: SampleRate::new(48000).unwrap(),
             do_output: false,
             global_volume: Arc::new(AtomicU32::from(1.0f32.to_bits())),
+            gb_audio: Arc::new(GbAudioParams::default()),
             end_times: HashMap::new(),
             multimedia_end: None,
             audio_recorder: None,
@@ -128,10 +191,11 @@ impl AudioManager {
     #[cfg(target_os = "android")]
     fn new_android(do_output: bool) -> Self {
         let global_volume = Arc::new(AtomicU32::from(1.0f32.to_bits()));
+        let gb_audio = Arc::new(GbAudioParams::default());
         if !do_output {
             return Self::disabled();
         }
-        match aaudio::open(global_volume.clone()) {
+        match aaudio::open(global_volume.clone(), gb_audio.clone()) {
             Ok((stream, channels, sample_rate, mixer_handle)) => Self {
                 mixer: None,
                 sample_sender: None,
@@ -140,6 +204,7 @@ impl AudioManager {
                 mixer_sample_rate: sample_rate,
                 do_output,
                 global_volume,
+                gb_audio,
                 end_times: HashMap::new(),
                 multimedia_end: None,
                 audio_recorder: None,
@@ -180,7 +245,8 @@ impl AudioManager {
         let sample_rate = device.sample_rate();
         let channel_count = device.channel_count();
         let global_volume = Arc::new(AtomicU32::from(1.0f32.to_bits()));
-        let (mixer, mixer_handle) = Mixer::new(sample_rate, channel_count, global_volume.clone());
+        let gb_audio = Arc::new(GbAudioParams::default());
+        let (mixer, mixer_handle) = Mixer::new(sample_rate, channel_count, global_volume.clone(), gb_audio.clone());
         let (sample_sender, sample_receiver) = mpsc::channel();
 
         let interprocess_source = InterprocessSource::new(sample_receiver, channel_count, sample_rate);
@@ -219,6 +285,7 @@ impl AudioManager {
                 mixer_sample_rate: sample_rate,
                 do_output,
                 global_volume,
+                gb_audio,
                 end_times: HashMap::new(),
                 multimedia_end: None,
                 audio_recorder: audio_recorder,
@@ -239,6 +306,7 @@ impl AudioManager {
                 mixer_sample_rate: sample_rate,
                 do_output,
                 global_volume,
+                gb_audio,
                 end_times: HashMap::new(),
                 multimedia_end: None,
                 audio_recorder: audio_recorder,
@@ -272,6 +340,14 @@ impl AudioManager {
     pub fn stop_audio_capture(&mut self) {
         if let Some(recorder) = self.audio_recorder.take() {
             recorder.wait_with_output().expect("audio recorder should close");
+        }
+    }
+
+
+    pub fn set_gb_audio(&self, settings: Option<GbAudioSettings>) {
+        self.gb_audio.set(settings);
+        if let Some(settings) = settings {
+            eprintln!("[gb-audio] activo: {} bits, {} Hz, mono={}", settings.bits, settings.sample_rate, settings.mono);
         }
     }
 
@@ -561,9 +637,15 @@ pub(crate) fn check_mp3(file: Box<[u8]>) -> Result<(), String> {
 /// Stops and resumes the audio output when the app goes to the background and comes back.
 pub fn set_output_paused(paused: bool) {
     #[cfg(target_os = "android")]
-    aaudio::set_paused(paused);
+    aaudio::set_activity_paused(paused);
     #[cfg(not(target_os = "android"))]
     let _ = paused;
+}
+
+/// Pauses or resumes only because another app took or returned audio focus.
+#[cfg(target_os = "android")]
+pub fn set_focus_paused(paused: bool) {
+    aaudio::set_focus_paused(paused);
 }
 
 // This function takes a volume between 0.0 and 1.0 and converts it to the logarithmic scale used by DirectMusic.

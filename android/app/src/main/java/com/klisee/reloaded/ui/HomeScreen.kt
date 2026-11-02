@@ -2,6 +2,7 @@ package com.klisee.reloaded.ui
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,16 +13,19 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Article
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
@@ -33,11 +37,11 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearWavyProgressIndicator
 import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -50,9 +54,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.klisee.reloaded.Blog
 import com.klisee.reloaded.Emulator
 import com.klisee.reloaded.GameRepository
@@ -71,6 +78,7 @@ fun HomeScreen(
     onRequestNetwork: () -> Unit,
     onLog: () -> Unit,
     onAbout: () -> Unit,
+    onReloadedOnline: () -> Unit,
     onLaunch: () -> Unit,
     launching: Boolean = false,
     onSettings: () -> Unit,
@@ -83,6 +91,9 @@ fun HomeScreen(
     var status by remember(revision) { mutableStateOf(repo.status()) }
     var busy by remember { mutableStateOf(false) }
     var progress by remember { mutableStateOf<Int?>(null) }
+    // The install's own little console: the last lines of what it is doing, so a slow import never
+    // looks frozen and a failure says where it happened without opening the Logs screen.
+    var installLog by remember { mutableStateOf(emptyList<String>()) }
     var post by remember { mutableStateOf<Blog.Post?>(null) }
     var blogError by remember { mutableStateOf<String?>(null) }
     var loadingPost by remember { mutableStateOf(true) }
@@ -105,13 +116,27 @@ fun HomeScreen(
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
+        val hadGame = status is GameRepository.Status.Ready
         busy = true
+        installLog = emptyList()
+        progress = null
         scope.launch {
-            val result = repo.import(uri) { progress = it }
+            val result = repo.import(
+                uri,
+                onProgress = { progress = it },
+                onLog = { line -> installLog = (installLog + line).takeLast(40) },
+            )
             busy = false
             progress = null
             status = repo.status()
-            snackbar.showSnackbar(result.fold({ "Juego instalado." }, { it.message ?: "No pude importar el juego." }))
+            snackbar.showSnackbar(
+                result.fold(
+                    {
+                        if (hadGame) "Juego actualizado. Tus partidas se conservaron." else "Juego instalado."
+                    },
+                    { it.message ?: "No pude importar el juego." },
+                ),
+            )
         }
     }
 
@@ -126,8 +151,13 @@ fun HomeScreen(
             TopAppBar(
                 title = { Text("Pokemon Reloaded", style = MaterialTheme.typography.titleLarge) },
                 actions = {
-                    IconButton(onClick = onLog) { Icon(Icons.Filled.Article, contentDescription = "Logs") }
-                    IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, contentDescription = "Ajustes") }
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        modifier = Modifier.padding(end = 6.dp),
+                    ) {
+                        CircleIconButton(Icons.Filled.Article, "Logs", onLog)
+                        CircleIconButton(Icons.Filled.Settings, "Ajustes", onSettings)
+                    }
                 },
             )
         },
@@ -179,6 +209,16 @@ fun HomeScreen(
                         Spacer(Modifier.width(12.dp))
                         Text(if (launching) "Cargando..." else "Jugar", style = MaterialTheme.typography.titleLarge)
                     }
+                    OutlinedButton(
+                        onClick = onReloadedOnline,
+                        enabled = installed != null && !busy && !launching,
+                        modifier = Modifier.fillMaxWidth().height(52.dp),
+                        shape = MaterialTheme.shapes.extraLarge,
+                    ) {
+                        Icon(Icons.Filled.Language, contentDescription = null, modifier = Modifier.size(22.dp))
+                        Spacer(Modifier.width(10.dp))
+                        Text("Reloaded Online")
+                    }
                     if (installed == null) {
                         Text(
                             text = "Para jugar hace falta el juego: descargalo del blog o importa el zip que ya tengas.",
@@ -214,10 +254,23 @@ fun HomeScreen(
                 }
             }
 
-            ImportPanel(busy = busy, progress = progress)
+            ImportPanel(busy = busy, progress = progress, lines = installLog)
         }
     }
 }
+}
+
+/** A small top-bar action on its own dark disc, so the icon reads clearly over the page. */
+@Composable
+private fun CircleIconButton(icon: ImageVector, description: String, onClick: () -> Unit) {
+    IconButton(
+        onClick = onClick,
+        modifier = Modifier
+            .size(40.dp)
+            .background(MaterialTheme.colorScheme.surfaceContainerHigh, CircleShape),
+    ) {
+        Icon(icon, contentDescription = description, modifier = Modifier.size(20.dp))
+    }
 }
 
 /**
@@ -227,7 +280,7 @@ fun HomeScreen(
  */
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-private fun ImportPanel(busy: Boolean, progress: Int?) {
+private fun ImportPanel(busy: Boolean, progress: Int?, lines: List<String>) {
     if (!busy) return
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Surface(color = MaterialTheme.colorScheme.scrim.copy(alpha = 0.5f), modifier = Modifier.fillMaxSize()) {}
@@ -237,9 +290,9 @@ private fun ImportPanel(busy: Boolean, progress: Int?) {
             modifier = Modifier.padding(32.dp),
         ) {
             Column(
-                modifier = Modifier.padding(28.dp),
+                modifier = Modifier.padding(24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(20.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 Text(
                     text = if (progress == null) "Preparando el archivo…" else "Instalando el juego…",
@@ -250,9 +303,47 @@ private fun ImportPanel(busy: Boolean, progress: Int?) {
                     LoadingIndicator()
                 } else {
                     LinearWavyProgressIndicator(progress = { progress / 100f }, modifier = Modifier.fillMaxWidth())
-                    Text("$progress %", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        "$progress %",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
+                ImportConsole(lines)
             }
+        }
+    }
+}
+
+/** The install's own terminal: the latest lines, auto-scrolled and in monospace. */
+@Composable
+private fun ImportConsole(lines: List<String>) {
+    if (lines.isEmpty()) return
+    val scroll = rememberScrollState()
+    LaunchedEffect(lines.size) { scroll.scrollTo(scroll.maxValue) }
+    Surface(
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surfaceContainerLowest,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+            Text(
+                text = "Registro",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            Text(
+                text = lines.takeLast(6).joinToString("\n"),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 104.dp)
+                    .padding(top = 4.dp)
+                    .verticalScroll(scroll),
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.sp,
+                lineHeight = 14.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }

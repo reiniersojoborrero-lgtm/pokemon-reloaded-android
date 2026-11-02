@@ -17,7 +17,6 @@ import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -39,11 +38,12 @@ import com.klisee.reloaded.Emulator
 import com.klisee.reloaded.GameRepository
 import com.klisee.reloaded.Preferences
 import com.klisee.reloaded.Update
+import com.klisee.reloaded.discord.DiscordRpcManager
 import com.klisee.reloaded.installUpdate
 import kotlinx.coroutines.launch
 
 /** Screens reached from a tab rather than being tabs themselves. */
-private enum class Pushed { About, Controls, MySaves }
+private enum class Pushed { About, Controls, Discord, TouchSettings, Fps, TouchLayout, MySaves, Mods, ReloadedOnline }
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
@@ -61,9 +61,13 @@ fun App(repo: GameRepository, prefs: Preferences) {
     val scope = rememberCoroutineScope()
 
     val lifecycleOwner = LocalLifecycleOwner.current
+    var resumeTick by remember { mutableStateOf(0) }
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) launching = false
+            if (event == Lifecycle.Event.ON_RESUME) {
+                launching = false
+                resumeTick++
+            }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
@@ -129,7 +133,7 @@ fun App(repo: GameRepository, prefs: Preferences) {
                     total = 0
                     problem = null
                     scope.launch {
-                        val result = Update.download(url, java.io.File(context.cacheDir, "update.apk")) { done, size ->
+                        val result = Update.download(url, java.io.File(context.cacheDir, "update.apk"), release.digest) { done, size ->
                             written = done
                             total = size
                         }
@@ -157,6 +161,23 @@ fun App(repo: GameRepository, prefs: Preferences) {
         )
     }
 
+    val english = prefs.resolvedGameLanguage() == "en"
+    val launcherLabel = when {
+        !onboarded -> if (english) "Ready to start" else "Listo para iniciar"
+        pushed == Pushed.About -> if (english) "Viewing About" else "Viendo el Acerca de"
+        pushed == Pushed.Controls -> if (english) "Customizing the Gamepad" else "Personalizando el Mando"
+        pushed == Pushed.Discord -> if (english) "Viewing Rich Presence" else "Viendo el Rich Presence"
+        pushed == Pushed.TouchSettings || pushed == Pushed.TouchLayout ->
+            if (english) "Customizing the Controls" else "Personalizando los Controles"
+        pushed == Pushed.MySaves -> if (english) "Viewing the Saves" else "Viendo las Partidas"
+        tab == Tab.Log -> if (english) "In Logs" else "En los Logs"
+        tab == Tab.Settings -> if (english) "In Settings" else "En los Ajustes"
+        else -> if (english) "Ready to start" else "Listo para iniciar"
+    }
+    LaunchedEffect(launcherLabel, resumeTick) {
+        DiscordRpcManager.setLauncherScreen(launcherLabel)
+    }
+
     if (!onboarded) {
         Onboarding(
             repo = repo,
@@ -170,8 +191,26 @@ fun App(repo: GameRepository, prefs: Preferences) {
 
     when (pushed) {
         Pushed.About -> AboutScreen(onBack = { pushed = null })
-        Pushed.Controls -> ControlsScreen(prefs = prefs, filesDir = context.filesDir, onBack = { pushed = null })
+        Pushed.Controls -> ControlsScreen(
+            prefs = prefs,
+            filesDir = context.filesDir,
+            onBack = { pushed = null },
+        )
+        Pushed.Discord -> DiscordScreen(prefs = prefs, onBack = { pushed = null })
+        Pushed.TouchSettings -> TouchSettingsScreen(prefs = prefs, onBack = { pushed = null })
+        Pushed.Fps -> FpsScreen(prefs = prefs, onBack = { pushed = null })
+        Pushed.TouchLayout -> TouchLayoutScreen(prefs = prefs, onBack = { pushed = null })
         Pushed.MySaves -> MySavesScreen(repo = repo, onBack = { pushed = null })
+        Pushed.Mods -> ModsScreen(filesDir = context.filesDir, onBack = { pushed = null })
+        Pushed.ReloadedOnline -> ReloadedOnlineScreen(
+            repo = repo,
+            onBack = { pushed = null },
+            onStart = {
+                launching = true
+                DiscordRpcManager.setLauncherScreen(null)
+                Emulator.start(context)
+            },
+        )
         null -> Box(modifier = Modifier.fillMaxSize()) {
             HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
                 when (Tab.entries[page]) {
@@ -182,8 +221,10 @@ fun App(repo: GameRepository, prefs: Preferences) {
                         onRequestNetwork = { requestNetwork.launch(Manifest.permission.INTERNET) },
                         onLog = { scope.launch { pagerState.animateScrollToPage(Tab.Log.ordinal) } },
                         onAbout = { pushed = Pushed.About },
+                        onReloadedOnline = { pushed = Pushed.ReloadedOnline },
                         onLaunch = {
                             launching = true
+                            DiscordRpcManager.setLauncherScreen(null)
                             Emulator.start(context)
                         },
                         launching = launching,
@@ -197,7 +238,11 @@ fun App(repo: GameRepository, prefs: Preferences) {
                         onLog = { scope.launch { pagerState.animateScrollToPage(Tab.Log.ordinal) } },
                         onAbout = { pushed = Pushed.About },
                         onControls = { pushed = Pushed.Controls },
+                        onDiscord = { pushed = Pushed.Discord },
+                        onTouchSettings = { pushed = Pushed.TouchSettings },
+                        onFpsSettings = { pushed = Pushed.Fps },
                         onMySaves = { pushed = Pushed.MySaves },
+                        onMods = { pushed = Pushed.Mods },
                         onUpdateFound = { update = it },
                     )
                 }

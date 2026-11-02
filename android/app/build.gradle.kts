@@ -12,22 +12,40 @@ val keystoreProperties = Properties().apply {
     if (file.exists()) file.inputStream().use { load(it) }
 }
 
-// The emulator is a Rust cdylib produced by cargo-ndk:
-//   cd src/OpenGMK && cargo ndk -t arm64-v8a --platform 29 build -p gm8emulator --release
-// Copy it into jniLibs before packaging, refusing a missing or zeroed-out (unclean shutdown) .so.
-val emulatorSo = rootProject.file("../src/OpenGMK/target/aarch64-linux-android/release/libgm8emulator.so")
-val jniLibDir = layout.projectDirectory.dir("src/main/jniLibs/arm64-v8a")
+// One APK per architecture, plus a universal one with all of them:
+//   ./build.sh assembleRelease                         (arm64-v8a, the default)
+//   ./build.sh assembleRelease -PtargetAbi=armeabi-v7a
+//   ./build.sh assembleRelease -PtargetAbi=x86_64
+//   ./build.sh assembleRelease -PtargetAbi=universal
+// after building the same ABIs with cargo-ndk (the error below prints the exact commands).
+val appVersion = "0.4.1"
+val allAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+val rustTargetOf = mapOf(
+    "arm64-v8a" to "aarch64-linux-android",
+    "armeabi-v7a" to "armv7-linux-androideabi",
+    "x86_64" to "x86_64-linux-android",
+)
+val targetAbi = providers.gradleProperty("targetAbi").orElse("arm64-v8a").get()
+val universal = targetAbi == "universal"
+require(universal || targetAbi in allAbis) { "ABI no soportada: $targetAbi" }
+val buildAbis = if (universal) allAbis else listOf(targetAbi)
+val emulatorSos = buildAbis.associateWith { abi ->
+    rootProject.file("../src/OpenGMK/target/${rustTargetOf.getValue(abi)}/release/libgm8emulator.so")
+}
 val copyEmulatorSo by tasks.registering {
-    inputs.file(emulatorSo).withPropertyName("emulatorSo").optional()
-    outputs.dir(jniLibDir)
+    inputs.files(emulatorSos.values.map { it }).optional()
+    outputs.dirs(buildAbis.map { layout.projectDirectory.dir("src/main/jniLibs/$it") })
     doLast {
-        if (!emulatorSo.isFile) error("falta ${emulatorSo}; compila con: cargo ndk -t arm64-v8a --platform 29 build -p gm8emulator --release")
-        val magic = emulatorSo.inputStream().use { it.readNBytes(4) }
-        if (magic.size < 4 || magic[0] != 0x7F.toByte() || magic[1] != 'E'.code.toByte() || magic[2] != 'L'.code.toByte() || magic[3] != 'F'.code.toByte()) {
-            error("${emulatorSo} no es un ELF valido (¿quedó a cero tras un corte?)")
+        for (abi in buildAbis) {
+            val so = emulatorSos.getValue(abi)
+            if (!so.isFile) error("falta $so; compila con: cargo ndk -t $abi --platform 29 build -p gm8emulator --release")
+            val magic = so.inputStream().use { it.readNBytes(4) }
+            if (magic.size < 4 || magic[0] != 0x7F.toByte() || magic[1] != 'E'.code.toByte() || magic[2] != 'L'.code.toByte() || magic[3] != 'F'.code.toByte()) {
+                error("$so no es un ELF valido (¿quedó a cero tras un corte?)")
+            }
+            val out = layout.projectDirectory.dir("src/main/jniLibs/$abi").asFile.apply { mkdirs() }.resolve("libgm8emulator.so")
+            so.copyTo(out, overwrite = true)
         }
-        val out = jniLibDir.asFile.apply { mkdirs() }.resolve("libgm8emulator.so")
-        emulatorSo.copyTo(out, overwrite = true)
     }
 }
 
@@ -37,11 +55,12 @@ android {
 
     defaultConfig {
         applicationId = "com.klisee.reloaded"
-        minSdk = 29
+        // AAudio exists since Android 8 (API 26), which is the real floor of the engine.
+        minSdk = 26
         targetSdk = 36
-        versionCode = 5
-        versionName = "0.2.3"
-        ndk { abiFilters += "arm64-v8a" }
+        versionCode = 18
+        versionName = appVersion
+        ndk { abiFilters += buildAbis }
     }
 
     signingConfigs {
@@ -80,6 +99,17 @@ android {
 
 tasks.named("preBuild") { dependsOn(copyEmulatorSo) }
 
+// Name every release APK after the full ABI (arm64-v8a, not just "arm64"), so the files that come
+// out of the build are the ones that get published.
+androidComponents {
+    onVariants { variant ->
+        if (variant.buildType != "release") return@onVariants
+        variant.outputs.forEach { output ->
+            output.outputFileName.set("pokemon-reloaded-$appVersion-${if (universal) "universal" else targetAbi}.apk")
+        }
+    }
+}
+
 dependencies {
     implementation("androidx.core:core-ktx:1.19.0")
     implementation("androidx.activity:activity-compose:1.13.0")
@@ -91,4 +121,7 @@ dependencies {
     implementation("androidx.compose.material3:material3:1.5.0-alpha28")
     implementation("androidx.compose.material:material-icons-extended:1.7.6")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+
+    // Discord Rich Presence: la conexión con el Gateway es un WebSocket.
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }

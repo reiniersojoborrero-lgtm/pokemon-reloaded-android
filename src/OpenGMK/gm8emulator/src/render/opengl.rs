@@ -1,8 +1,8 @@
 use crate::{
     render::{
         atlas::{AtlasBuilder, AtlasRect, AtlasRef},
-        mat4mult, BlendType, Fog, Light, PrimitiveBuilder, PrimitiveShape, PrimitiveType, RendererOptions,
-        RendererTrait, SavedTexture, Scaling, Vertex, VertexBuffer,
+        mat4mult, BlendType, CrtSettings, Fog, GbSettings, Light, PrimitiveBuilder, PrimitiveShape,
+        PrimitiveType, RendererOptions, RendererTrait, SavedTexture, Scaling, Vertex, VertexBuffer,
     },
     types::Colour,
 };
@@ -105,10 +105,13 @@ struct RenderState {
     // frag shader
     texture_repeat: GLBool,
     interpolate_pixels: GLBool,
-    depth_test: GLBool,
+    alpha_test: GLBool,
     fog_enabled: GLBool,
     fog_begin: f32,
     fog_end: f32,
+    // std140 alignment: `fog_colour` is a vec4, so it has to start on a 16-byte boundary (offset 576).
+    // Without this padding the shader read every field after it from the wrong place.
+    _fog_pad: [u32; 3],
     fog_colour: [f32; 4],
     // end of shader stuff
     end_of_uniform: (),
@@ -116,6 +119,9 @@ struct RenderState {
     proj_matrix: [f32; 16],
     alpha_blending: bool,
     blend_mode: (BlendType, BlendType),
+    // Depth test is a GL state, not something the shader reads: it lives after `end_of_uniform` so
+    // it never lands in front of a shader field.
+    depth_test: GLBool,
     write_depth: bool,
     culling: bool,
 }
@@ -142,9 +148,11 @@ impl Default for RenderState {
             depth_test: false.into(),
             write_depth: false,
             culling: false,
+            alpha_test: GLBool::False,
             fog_enabled: GLBool::False,
             fog_begin: 0.0,
             fog_end: 0.0,
+            _fog_pad: [0; 3],
             lighting: GLBool::False,
             gouraud: GLBool::True,
             ambient_colour: [0.0; 4],
@@ -191,8 +199,12 @@ impl RenderState {
 pub struct RendererImpl {
     imp: native_gl::PlatformImpl,
     gl: gl::Gl,
-    //program: GLuint,
-    //vao: GLuint,
+    /// The sprite shader and the buffers it draws from. They are bound again before every draw,
+    /// because another pass (the touch overlay, for one) may have changed them in between, and on
+    /// some drivers — PowerVR among them — drawing with the wrong vertex array produces nothing.
+    program: GLuint,
+    vao: GLuint,
+    commands_vbo: GLuint,
     atlas_packers: Vec<DensePacker>,
     texture_ids: Vec<Option<GLuint>>,
     zbuf_ids: Vec<Option<GLuint>>,
@@ -201,6 +213,9 @@ pub struct RendererImpl {
     stock_texture_count: usize,
     stock_atlas_count: u32,
     current_atlas: u32,
+    /// What is bound right now, so the texture state is only touched when it actually changes.
+    current_texture: Option<GLuint>,
+    last_filter_mode: Option<GLenum>,
     framebuffer: Framebuffer,
     stored_framebuffer: Option<Framebuffer>,
     zbuf_format: GLint,
@@ -221,20 +236,85 @@ pub struct RendererImpl {
 
     loc_gm81_normalize: GLint, // uniform bool gm81_normalize
     loc_tex: GLint,            // uniform sampler2D tex
+    loc_interp: GLint,         // uniform float interp_amount
     buf_state: GLuint,         // uniform RenderState state
+    /// World-space offset tagged on the vertices currently being submitted. The game sets it before
+    /// each instance's draw event so interpolation stays a rendering concern.
+    draw_offset: [f32; 2],
+    /// How much of `draw_offset` the shader applies (0 = current game step, 1 = previous one).
+    interp_amount: f32,
+
+    crt: Option<CrtEffect>,
+    crt_settings: Option<CrtSettings>,
+    gb_settings: Option<GbSettings>,
+    gb_inverted: bool,
 
     /// Lazily-built program/buffers for the on-screen touch controls (Android only).
     #[cfg(target_os = "android")]
     overlay: Option<Overlay>,
 }
 
+/// One image in the packed control artwork: which control it belongs to, and where it sits in the
+/// texture (u1, v1, u2, v2).
+#[cfg(target_os = "android")]
+#[derive(Clone, Copy)]
+struct SkinSlot {
+    name: &'static str,
+    uv: [f32; 4],
+    /// Width over height of the artwork, so a picture that is not square is not stretched into one
+    /// when it is drawn. Most of the artwork is square and this makes no difference for it.
+    aspect: f32,
+    custom: bool,
+    context: u8,
+    has_art: bool,
+}
+
+/// How many control images the overlay can carry. Everything a control needs is one slot.
+#[cfg(target_os = "android")]
+const MAX_SKIN_SLOTS: usize = 96;
+
+/// Side of each party sprite's square cell in the strip the overlay keeps for them.
+#[cfg(target_os = "android")]
+const PARTY_CELL: u32 = 64;
+
 /// A tiny self-contained GL program to draw the touch controls over the frame, without touching
 /// the emulator's own render state.
 #[cfg(target_os = "android")]
+#[derive(Clone, Copy)]
 struct Overlay {
     program: GLuint,
     vao: GLuint,
     vbo: GLuint,
+    /// A 1x1 white texture, so the plain shapes sample something neutral.
+    white: GLuint,
+    /// The packed pixel-art control artwork, or 0 when none was found.
+    skin: GLuint,
+    slots: [Option<SkinSlot>; MAX_SKIN_SLOTS],
+    loc_tex: GLint,
+    /// The party's own sprite strip, one cell per slot, refilled when the game's party changes.
+    party: GLuint,
+    party_version: u64,
+}
+
+#[cfg(target_os = "android")]
+impl Overlay {
+    fn slot(&self,name:&str)->Option<&SkinSlot>{
+        let context=crate::touch_controls::current_context();
+        self.slots.iter().flatten().find(|s|s.name==name&&s.context==context).or_else(||self.slots.iter().flatten().find(|s|s.name==name&&s.context==0))
+    }
+    /// Where a control's artwork sits in the packed texture, if it has any.
+    fn art(&self, name: &str) -> Option<[f32; 4]> {
+        self.slot(name).filter(|slot|slot.has_art).map(|slot|slot.uv)
+    }
+
+    fn custom_art(&self, name: &str) -> bool {
+        self.slot(name).is_some_and(|slot|slot.custom)
+    }
+
+    /// The shape of a control's artwork, so it can be drawn as it was painted.
+    fn art_aspect(&self, name: &str) -> Option<f32> {
+        self.slot(name).map(|slot|slot.aspect)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -242,10 +322,140 @@ struct Framebuffer {
     pub texture: GLuint,
     pub zbuf: GLuint,
     pub fbo: GLuint,
+    /// Kept here instead of asking the driver with `glGetTexLevelParameteriv`, which is not
+    /// dependable everywhere: on PowerVR it answered nothing, the viewport came out empty and the
+    /// whole frame was clipped away.
+    pub width: u32,
+    pub height: u32,
+}
+
+/// A self-contained full-screen shader pass for the CRT look.
+struct CrtEffect {
+    program: GLuint,
+    vao: GLuint,
+    vbo: GLuint,
+    loc_scene: GLint,
+    loc_resolution: GLint,
+    loc_curvature: GLint,
+    loc_scanline: GLint,
+    loc_scanline_count: GLint,
+    loc_mask: GLint,
+    loc_aberration: GLint,
+    loc_vignette: GLint,
+    loc_blur: GLint,
+    loc_noise: GLint,
+    loc_brightness: GLint,
+    loc_saturation: GLint,
+    loc_glow: GLint,
+    loc_corner: GLint,
+    loc_gb_strength: GLint,
+    loc_gb_dither: GLint,
+    loc_gb_contrast: GLint,
+    loc_gb_brightness: GLint,
+    loc_gb_invert: GLint,
+}
+
+impl CrtEffect {
+    unsafe fn new(gl: &gl::Gl) -> Result<Self, String> {
+        let vertex_shader = gl.CreateShader(gl::VERTEX_SHADER);
+        let vertex_source = shader_source(CRT_VERTEX_SHADER_SOURCE);
+        gl.ShaderSource(vertex_shader, 1, &(vertex_source.as_ptr().cast()), ptr::null());
+        gl.CompileShader(vertex_shader);
+        let mut success = gl::FALSE as GLint;
+        gl.GetShaderiv(vertex_shader, gl::COMPILE_STATUS, &mut success);
+        if success != gl::TRUE as GLint {
+            return Err(shader_info_log(gl, "CRT vertex", vertex_shader))
+        }
+
+        let fragment_shader = gl.CreateShader(gl::FRAGMENT_SHADER);
+        let fragment_source = shader_source(CRT_FRAGMENT_SHADER_SOURCE);
+        gl.ShaderSource(fragment_shader, 1, &(fragment_source.as_ptr().cast()), ptr::null());
+        gl.CompileShader(fragment_shader);
+        gl.GetShaderiv(fragment_shader, gl::COMPILE_STATUS, &mut success);
+        if success != gl::TRUE as GLint {
+            return Err(shader_info_log(gl, "CRT fragment", fragment_shader))
+        }
+
+        let program = gl.CreateProgram();
+        gl.AttachShader(program, vertex_shader);
+        gl.AttachShader(program, fragment_shader);
+        gl.LinkProgram(program);
+        gl.GetProgramiv(program, gl::LINK_STATUS, &mut success);
+        if success != gl::TRUE as GLint {
+            let mut info_len: GLint = 0;
+            gl.GetProgramiv(program, gl::INFO_LOG_LENGTH, &mut info_len);
+            let mut info = vec![0u8; info_len as usize];
+            gl.GetProgramInfoLog(program, info_len as GLsizei, ptr::null_mut(), info.as_mut_ptr() as *mut GLchar);
+            info.set_len((info_len - 1) as usize);
+            return Err(format!(
+                "Failed to link CRT shaders, compiler output:\n{}",
+                std::str::from_utf8(&info).unwrap_or("<INVALID UTF-8>")
+            ))
+        }
+        gl.DeleteShader(vertex_shader);
+        gl.DeleteShader(fragment_shader);
+
+        let vertices: [f32; 24] = [
+            -1.0, -1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 0.0, -1.0, 1.0, 0.0, 1.0,
+            -1.0, 1.0, 0.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0,
+        ];
+        let mut vao = 0;
+        let mut vbo = 0;
+        gl.GenVertexArrays(1, &mut vao);
+        gl.GenBuffers(1, &mut vbo);
+        gl.BindVertexArray(vao);
+        gl.BindBuffer(gl::ARRAY_BUFFER, vbo);
+        gl.BufferData(
+            gl::ARRAY_BUFFER,
+            (vertices.len() * size_of::<f32>()) as _,
+            vertices.as_ptr().cast(),
+            gl::STATIC_DRAW,
+        );
+        gl.EnableVertexAttribArray(0);
+        gl.VertexAttribPointer(0, 2, gl::FLOAT, gl::FALSE, 4 * size_of::<f32>() as i32, ptr::null());
+        gl.EnableVertexAttribArray(1);
+        gl.VertexAttribPointer(
+            1,
+            2,
+            gl::FLOAT,
+            gl::FALSE,
+            4 * size_of::<f32>() as i32,
+            (2 * size_of::<f32>()) as *const _,
+        );
+        gl.BindVertexArray(0);
+
+        let loc = |name: &'static [u8]| gl.GetUniformLocation(program, name.as_ptr().cast());
+        Ok(Self {
+            program,
+            vao,
+            vbo,
+            loc_scene: loc(b"scene\0"),
+            loc_resolution: loc(b"resolution\0"),
+            loc_curvature: loc(b"curvature\0"),
+            loc_scanline: loc(b"scanline\0"),
+            loc_scanline_count: loc(b"scanline_count\0"),
+            loc_mask: loc(b"mask\0"),
+            loc_aberration: loc(b"aberration\0"),
+            loc_vignette: loc(b"vignette\0"),
+            loc_blur: loc(b"blur\0"),
+            loc_noise: loc(b"noise\0"),
+            loc_brightness: loc(b"brightness\0"),
+            loc_saturation: loc(b"saturation\0"),
+            loc_glow: loc(b"glow\0"),
+            loc_corner: loc(b"corner\0"),
+            loc_gb_strength: loc(b"gb_strength\0"),
+            loc_gb_dither: loc(b"gb_dither\0"),
+            loc_gb_contrast: loc(b"gb_contrast\0"),
+            loc_gb_brightness: loc(b"gb_brightness\0"),
+            loc_gb_invert: loc(b"gb_invert\0"),
+        })
+    }
 }
 
 static VERTEX_SHADER_SOURCE: &str = shader_file!("glsl/vertex.glsl");
 static FRAGMENT_SHADER_SOURCE: &str = shader_file!("glsl/fragment.glsl");
+static CRT_VERTEX_SHADER_SOURCE: &str = shader_file!("glsl/crt_vertex.glsl");
+static CRT_FRAGMENT_SHADER_SOURCE: &str = shader_file!("glsl/crt_fragment.glsl");
 
 unsafe fn shader_info_log(gl: &gl::Gl, name: &str, id: GLuint) -> String {
     let mut info_len: GLint = 0;
@@ -589,6 +799,15 @@ impl RendererImpl {
                 size_of::<Vertex>() as i32,
                 offset_of!(Vertex, atlas_xywh) as *const _,
             );
+            gl.EnableVertexAttribArray(5);
+            gl.VertexAttribPointer(
+                5,
+                2,
+                gl::FLOAT,
+                gl::FALSE,
+                size_of::<Vertex>() as i32,
+                offset_of!(Vertex, interp) as *const _,
+            );
 
             // Use program
             gl.UseProgram(program);
@@ -649,12 +868,20 @@ impl RendererImpl {
             gl.BindBufferBase(gl::UNIFORM_BUFFER, loc_state, buf_state);
             assert_eq!(gl.GetError(), 0);
 
+            let crt = match CrtEffect::new(&gl) {
+                Ok(effect) => Some(effect),
+                Err(err) => {
+                    eprintln!("[crt] no se pudo crear el efecto: {err}");
+                    None
+                },
+            };
+
             // Create Renderer
             let mut renderer = Self {
                 imp,
-                //program,
-                //vao,
-                //commands_vbo,
+                program,
+                vao,
+                commands_vbo,
                 atlas_packers: vec![],
                 texture_ids: vec![],
                 zbuf_ids: vec![],
@@ -663,10 +890,18 @@ impl RendererImpl {
                 stock_texture_count: 0,
                 stock_atlas_count: 0,
                 current_atlas: 0,
-                framebuffer: Framebuffer { texture: framebuffer_texture, zbuf: framebuffer_zbuf, fbo: framebuffer_fbo },
+                current_texture: None,
+                last_filter_mode: None,
+                framebuffer: Framebuffer {
+                    texture: framebuffer_texture,
+                    zbuf: framebuffer_zbuf,
+                    fbo: framebuffer_fbo,
+                    width: options.size.0,
+                    height: options.size.1,
+                },
                 stored_framebuffer: None,
                 zbuf_format,
-            zbuf_type,
+                zbuf_type,
                 zbuf_trashed: false,
                 white_pixel: Default::default(),
                 vertex_queue: Vec::with_capacity(1536),
@@ -689,7 +924,14 @@ impl RendererImpl {
 
                 loc_gm81_normalize: gl.GetUniformLocation(program, b"gm81_normalize\0".as_ptr().cast()),
                 loc_tex: gl.GetUniformLocation(program, b"tex\0".as_ptr().cast()),
+                loc_interp: gl.GetUniformLocation(program, b"interp_amount\0".as_ptr().cast()),
                 buf_state,
+                draw_offset: [0.0, 0.0],
+                interp_amount: 0.0,
+                crt,
+                crt_settings: None,
+                gb_settings: None,
+                gb_inverted: false,
 
                 #[cfg(target_os = "android")]
                 overlay: None,
@@ -701,6 +943,7 @@ impl RendererImpl {
             // default uniform values
             renderer.gl.Uniform1i(renderer.loc_gm81_normalize, options.normalize_normals as _);
             renderer.gl.Uniform1i(renderer.loc_tex, 0 as _);
+            renderer.gl.Uniform1f(renderer.loc_interp, 0.0);
             renderer.gl.BindBuffer(gl::UNIFORM_BUFFER, renderer.buf_state);
             renderer.gl.BufferData(
                 gl::UNIFORM_BUFFER,
@@ -723,11 +966,8 @@ impl RendererImpl {
 
     fn setup_frame(&mut self, clear_colour: Colour) {
         unsafe {
-            // get framebuffer size
-            let (mut width, mut height) = (0, 0);
-            self.gl.BindTexture(gl::TEXTURE_2D, self.framebuffer.texture);
-            self.gl.GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_WIDTH, &mut width);
-            self.gl.GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_HEIGHT, &mut height);
+            let width = self.framebuffer.width as i32;
+            let height = self.framebuffer.height as i32;
             // set view
             self.set_view(0, 0, width, height, 0.0, 0, 0, width, height);
             // clear screen
@@ -799,7 +1039,7 @@ impl RendererImpl {
                     (&self.queue_render_state as *const RenderState).cast(),
                     gl::STATIC_DRAW,
                 );
-                assert_eq!(self.gl.GetError(), 0);
+                debug_assert_eq!(self.gl.GetError(), 0);
             }
         }
     }
@@ -815,7 +1055,16 @@ impl RendererImpl {
 
     fn push_primitive(&mut self, builder: &PrimitiveBuilder) {
         self.setup_queue(builder.get_atlas_id(), builder.get_shape());
+        let start = self.vertex_queue.len();
         self.vertex_queue.extend_from_slice(builder.get_vertices());
+        // In native mode the uniform is zero and the attribute is irrelevant. Leave it at zero
+        // too, so a NaN/infinite game position can never reach the shader as `NaN * 0`.
+        if self.interp_amount != 0.0 {
+            let offset = self.draw_offset;
+            for vertex in &mut self.vertex_queue[start..] {
+                vertex.interp = offset;
+            }
+        }
     }
 
     fn draw_buffer(&mut self, atlas_id: u32, shape: PrimitiveShape, buffer: &[Vertex]) {
@@ -824,16 +1073,29 @@ impl RendererImpl {
         }
 
         unsafe {
-            // if something else broke check here just in case
+            // if something else broke check here just in case (only in debug builds to prevent mobile GPU stalls)
+            #[cfg(debug_assertions)]
             match self.gl.GetError() {
                 0 => (),
                 err => panic!("OpenGL threw an error somewhere (error code {})", err),
             }
 
-            self.gl.BindTexture(gl::TEXTURE_2D, self.texture_ids[atlas_id as usize].unwrap());
+            self.gl.UseProgram(self.program);
+            self.gl.BindVertexArray(self.vao);
+            self.gl.BindBuffer(gl::ARRAY_BUFFER, self.commands_vbo);
+
+            let tex_id = self.texture_ids[atlas_id as usize].unwrap();
             let filter_mode = if self.queue_render_state.interpolate_pixels.into() { gl::LINEAR } else { gl::NEAREST };
-            self.gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, filter_mode as _);
-            self.gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, filter_mode as _);
+            if self.current_texture != Some(tex_id) {
+                self.gl.BindTexture(gl::TEXTURE_2D, tex_id);
+                self.current_texture = Some(tex_id);
+                self.last_filter_mode = None;
+            }
+            if self.last_filter_mode != Some(filter_mode) {
+                self.gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, filter_mode as _);
+                self.gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, filter_mode as _);
+                self.last_filter_mode = Some(filter_mode);
+            }
 
             self.gl.BufferData(
                 gl::ARRAY_BUFFER,
@@ -841,26 +1103,346 @@ impl RendererImpl {
                 buffer.as_ptr().cast(),
                 gl::STREAM_DRAW,
             );
-            assert_eq!(self.gl.GetError(), 0);
+            debug_assert_eq!(self.gl.GetError(), 0);
 
+            self.gl.Uniform1f(self.loc_interp, self.interp_amount);
             self.gl.DrawArrays(shape.into(), 0, buffer.len() as i32);
-
-            // https://www.khronos.org/opengl/wiki/Buffer_Object_Streaming#Buffer_re-specification
-            // https://www.khronos.org/opengl/wiki/Buffer_Object#Invalidation
-            self.gl.BufferData(
-                gl::ARRAY_BUFFER,
-                (size_of::<Vertex>() * buffer.len()) as _,
-                ptr::null(),
-                gl::STREAM_DRAW,
-            );
         }
     }
 }
 
-/// Pushes one vertex, converting window pixels to clip space.
+/// Packs the pixel-art artwork the launcher leaves next to the game into one texture: the joystick's
+/// two images, plus one for every control that has a `<name>.png` beside it. Returns the texture (0
+/// when there is nothing) and where each image sits.
+#[cfg(target_os = "android")]
+fn load_skin(gl: &gl::Gl) -> (GLuint, [Option<SkinSlot>; MAX_SKIN_SLOTS]) {
+    let mut slots: [Option<SkinSlot>; MAX_SKIN_SLOTS] = [None; MAX_SKIN_SLOTS];
+    // Same folder the launcher writes `controls.conf` and `layout.conf` to.
+    let dir = crate::android_main::storage_dir().to_string_lossy().into_owned();
+    let mut images: Vec<(&'static str, image::RgbaImage, bool, u8, bool)> = Vec::new();
+    let load = |name: &str, fallback: &str| {
+        image::open(format!("{}/touch-sprites-active/{}.png", dir, name)).ok().map(|img| (img,true))
+            .or_else(|| image::open(format!("{}/{}", dir, fallback)).ok().map(|img| (img,false)))
+    };
+    for (name, file) in [
+        ("joystick", "joystick-base.png"),
+        ("joystick-knob", "joystick-knob.png"),
+        // The honeycomb the party wheel puts its slots in, and the border that marks the picked one.
+        ("selector", "seleccionarpokemon.png"),
+        ("selection", "bordeseleccionar.png"),
+        ("field-selector", "field-selector.png"),
+    ] {
+        if let Some((img, custom)) = load(name, file) {
+            images.push((name, img.to_rgba8(), custom,0,true));
+        }
+    }
+    for control in crate::touch_controls::controls() {
+        // The bundled aspect defines input geometry even with an imported picture.
+        if !matches!(control.name,"p"|"l"|"t"|"e"|"pkmn"|"sel_world"|"a"|"m"|"n"|"s"|"space") { if let Ok((w,h)) = image::image_dimensions(format!("{}/{}.png",dir,control.name)) {
+            crate::touch_controls::set_art_aspect(control.name,w as f32 / h.max(1) as f32);
+        }}
+        if let Some((img, custom)) = load(control.name, &format!("{}.png",control.name)) {
+            let mut image = img.to_rgba8();
+            if let Some(tint) = crate::touch_appearance::settings().tint {
+                for pixel in image.pixels_mut() { crate::touch_appearance::tint_pixel(&mut pixel.0, tint); }
+            }
+            images.push((control.name, image, custom,0,true));
+        }
+    }
+    for(prefix,context)in[("world",crate::touch_controls::WORLD),("battle",crate::touch_controls::BATTLE)]{
+        for name in["m","e","p","l","t","space","a"]{
+            let original=std::path::Path::new(&format!("{}/touch-sprites-active/{}__{}.original",dir,prefix,name)).is_file();
+            let scoped=format!("{}/touch-sprites-active/{}__{}.png",dir,prefix,name);
+            let bundled=format!("{}/{}__{}.png",dir,prefix,name);
+            let legacy=format!("{}/touch-sprites-active/{}.png",dir,name);
+            let (file,custom)=if !original && std::path::Path::new(&scoped).is_file(){(scoped,true)}
+                else if !original && std::path::Path::new(&legacy).is_file(){continue}
+                else if std::path::Path::new(&bundled).is_file(){(bundled,false)}
+                else if original{(format!("{}/{}.png",dir,name),false)}else{continue};
+            if let Ok(img)=image::open(file){
+                let mut img=img.to_rgba8();
+                if let Some(tint)=crate::touch_appearance::settings().tint{for pixel in img.pixels_mut(){crate::touch_appearance::tint_pixel(&mut pixel.0,tint);}}
+                images.push((name,img,custom,context,true));
+            }else if original{images.push((name,image::RgbaImage::new(1,1),false,context,false));}
+        }
+    }
+    images.sort_by_key(|(_,img,_,_,_)|std::cmp::Reverse(img.height()));
+    if images.is_empty() {
+        eprintln!("[overlay] sin arte pixel para los controles; se usan las formas dibujadas");
+        return (0, slots)
+    }
+    let sizes: Vec<_> = images.iter().map(|(_,img,_,_,_)| (img.width(),img.height())).collect();
+    let mut gpu_limit=0;
+    unsafe {gl.GetIntegerv(gl::MAX_TEXTURE_SIZE,&mut gpu_limit);}
+    let Some((width,height,positions))=crate::touch_skin::atlas_layout(&sizes,(gpu_limit.max(1) as u32).min(2048)) else {
+        eprintln!("[overlay] arte demasiado grande; se usan las formas dibujadas");
+        return (0,slots)
+    };
+    let mut pixels=vec![0u8;(width*height*4) as usize];
+    for (index,(name,img,custom,context,has_art)) in images.iter().enumerate() {
+        let (x,top)=positions[index];let row=(img.width()*4) as usize;
+        for y in 0..img.height() as usize {
+            let src=y*row;let dst=(((top+y as u32)*width+x)*4) as usize;
+            pixels[dst..dst+row].copy_from_slice(&img.as_raw()[src..src+row]);
+        }
+        if index<MAX_SKIN_SLOTS {slots[index]=Some(SkinSlot {name,custom:*custom,context:*context,has_art:*has_art,
+            aspect:img.width() as f32/img.height().max(1) as f32,
+            uv:[x as f32/width as f32,top as f32/height as f32,(x+img.width()) as f32/width as f32,(top+img.height()) as f32/height as f32],
+        });}
+    }
+    unsafe {
+        let mut texture = 0;
+        gl.GenTextures(1, &mut texture);
+        gl.BindTexture(gl::TEXTURE_2D, texture);
+        // Nearest keeps the pixel art crisp whatever size the control ends up.
+        gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as _);
+        gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as _);
+        gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as _);
+        gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as _);
+        gl.TexImage2D(
+            gl::TEXTURE_2D,
+            0,
+            gl::RGBA as _,
+            width as _,
+            height as _,
+            0,
+            gl::RGBA,
+            gl::UNSIGNED_BYTE,
+            pixels.as_ptr().cast(),
+        );
+        assert_eq!(gl.GetError(), 0);
+        eprintln!("[overlay] arte pixel de los controles cargado ({} imagenes, {}x{})", images.len(), width, height);
+        (texture, slots)
+    }
+}
+
+/// The clean text labels the launcher draws with a real sans-serif face. They live in their own
+/// texture so they can be sampled with LINEAR filtering without blurring the pixel-art controls.
+static LABEL_TEX: std::sync::Mutex<GLuint> = std::sync::Mutex::new(0);
+static LABELS: std::sync::Mutex<Vec<(String, [f32; 4], f32)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(target_os = "android")]
+fn label_file(text: &str) -> String {
+    let mut name = String::from("label_");
+    for c in text.chars() {
+        name.push(if c.is_ascii_alphanumeric() { c } else { '_' });
+    }
+    name.push_str(".png");
+    name
+}
+
+/// Packs the label images the launcher left in `files/touch-labels`, one slot per label text.
+#[cfg(target_os = "android")]
+fn load_label_skin(gl: &gl::Gl) -> GLuint {
+    let dir = crate::android_main::storage_dir().join("touch-labels");
+    let mut texts: Vec<&'static str> = Vec::new();
+    for control in crate::touch_controls::CLASSIC_CONTROLS {
+        if let crate::touch_controls::Label::Text(text) = control.label {
+            if !texts.contains(&text) {
+                texts.push(text);
+            }
+        }
+    }
+    let mut images: Vec<(&'static str, image::RgbaImage)> = Vec::new();
+    for text in texts {
+        if let Ok(img) = image::open(format!("{}/{}", dir.display(), label_file(text))) {
+            images.push((text, img.to_rgba8()));
+        }
+    }
+    if images.is_empty() {
+        return 0
+    }
+    let height = images.iter().map(|(_, img)| img.height()).max().unwrap_or(1).max(1);
+    let width: u32 = images.iter().map(|(_, img)| img.width()).sum::<u32>().max(1);
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+    let mut slots: Vec<(String, [f32; 4], f32)> = Vec::new();
+    let mut x = 0u32;
+    for (text, img) in &images {
+        let row = (img.width() * 4) as usize;
+        for y in 0..img.height() as usize {
+            let src = y * row;
+            let dst = (((y as u32) * width + x) * 4) as usize;
+            pixels[dst..dst + row].copy_from_slice(&img.as_raw()[src..src + row]);
+        }
+        slots.push((
+            (*text).to_string(),
+            [
+                x as f32 / width as f32,
+                0.0,
+                (x + img.width()) as f32 / width as f32,
+                img.height() as f32 / height as f32,
+            ],
+            img.width() as f32 / img.height().max(1) as f32,
+        ));
+        x += img.width();
+    }
+    unsafe {
+        let mut texture = 0;
+        gl.GenTextures(1, &mut texture);
+        gl.BindTexture(gl::TEXTURE_2D, texture);
+        gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as _);
+        gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as _);
+        gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as _);
+        gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as _);
+        gl.TexImage2D(
+            gl::TEXTURE_2D,
+            0,
+            gl::RGBA as _,
+            width as _,
+            height as _,
+            0,
+            gl::RGBA,
+            gl::UNSIGNED_BYTE,
+            pixels.as_ptr().cast(),
+        );
+        *LABEL_TEX.lock().unwrap() = texture;
+        *LABELS.lock().unwrap() = slots;
+        eprintln!("[overlay] etiquetas limpias cargadas ({} textos, {}x{})", images.len(), width, height);
+        texture
+    }
+}
+
+#[cfg(target_os = "android")]
+fn label_art(text: &str) -> Option<([f32; 4], f32)> {
+    LABELS.lock().unwrap().iter().find(|(known, _, _)| known == text).map(|(_, uv, aspect)| (*uv, *aspect))
+}
+
+#[cfg(target_os = "android")]
+fn label_texture() -> GLuint {
+    *LABEL_TEX.lock().unwrap()
+}
+
+/// Pushes a label as a texture quad, capped so a wide label still fits inside its button.
+#[cfg(target_os = "android")]
+fn push_label_sprite(out: &mut Vec<f32>, ww: f32, wh: f32, cx: f32, cy: f32, half_h: f32, uv: [f32; 4], aspect: f32) {
+    let max_w = half_h * 3.0;
+    let mut hh = half_h;
+    let mut hw = hh * aspect;
+    if hw > max_w {
+        hh *= max_w / hw;
+        hw = max_w;
+    }
+    push_sprite(out, ww, wh, cx - hw, cy - hh, cx + hw, cy + hh, uv[0], uv[1], uv[2], uv[3]);
+}
+
+/// Creates the strip the party's six sprites go in: one square cell each, transparent to start with.
+#[cfg(target_os = "android")]
+unsafe fn create_party_texture(gl: &gl::Gl) -> GLuint {
+    let mut texture = 0;
+    gl.GenTextures(1, &mut texture);
+    gl.BindTexture(gl::TEXTURE_2D, texture);
+    gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as _);
+    gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as _);
+    gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as _);
+    gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as _);
+    let width = PARTY_CELL * crate::touch_controls::PICKER_SLOTS as u32;
+    gl.TexImage2D(
+        gl::TEXTURE_2D,
+        0,
+        gl::RGBA as _,
+        width as _,
+        PARTY_CELL as _,
+        0,
+        gl::RGBA,
+        gl::UNSIGNED_BYTE,
+        std::ptr::null(),
+    );
+    assert_eq!(gl.GetError(), 0);
+    texture
+}
+
+/// Reads the party's sprites out of the game's own files and refills the strip, one cell each. Shiny
+/// Pokémon keep the offset the game stores, which is also what picks their folder.
+#[cfg(target_os = "android")]
+unsafe fn upload_party(gl: &gl::Gl, texture: GLuint, species: [i32; crate::touch_controls::PICKER_SLOTS]) {
+    let dir = crate::android_main::storage_dir().join("game/data");
+    let cell = PARTY_CELL as usize;
+    let cells = crate::touch_controls::PICKER_SLOTS;
+    let stride = cell * cells;
+    let mut strip = vec![0u8; stride * cell * 4];
+    for (slot, &value) in species.iter().enumerate() {
+        if value == 0 {
+            continue
+        }
+        let shiny = (1000..=2000).contains(&value) || (3000..=4000).contains(&value);
+        let folder = if shiny { "pkmn_shiny" } else { "pkmn" };
+        let Ok(image) = image::open(format!("{}/{}/{}.gif", dir.display(), folder, value)) else {
+            continue
+        };
+        let image = image.to_rgba8();
+        let (iw, ih) = (image.width() as usize, image.height() as usize);
+        if iw == 0 || ih == 0 {
+            continue
+        }
+        // Scale to fit the cell, square and centred, sampling nearest so the pixels stay crisp.
+        let scale = (cell as f32 / iw as f32).min(cell as f32 / ih as f32);
+        let (dw, dh) = (((iw as f32 * scale) as usize).max(1), ((ih as f32 * scale) as usize).max(1));
+        let (ox, oy) = ((cell - dw) / 2, (cell - dh) / 2);
+        for y in 0..dh {
+            for x in 0..dw {
+                let pixel = image.get_pixel((x * iw / dw) as u32, (y * ih / dh) as u32).0;
+                let index = ((oy + y) * stride + slot * cell + ox + x) * 4;
+                strip[index..index + 4].copy_from_slice(&pixel);
+            }
+        }
+    }
+    gl.BindTexture(gl::TEXTURE_2D, texture);
+    gl.TexSubImage2D(
+        gl::TEXTURE_2D,
+        0,
+        0,
+        0,
+        (cell * cells) as _,
+        cell as _,
+        gl::RGBA,
+        gl::UNSIGNED_BYTE,
+        strip.as_ptr().cast(),
+    );
+}
+
+/// Pushes one vertex, converting window pixels to clip space. The texture coordinate is left at the
+/// top-left of the overlay's 1x1 white texture, so a plain colour comes through untouched.
 #[cfg(target_os = "android")]
 fn push_vertex(out: &mut Vec<f32>, ww: f32, wh: f32, x: f32, y: f32, col: [f32; 4]) {
-    out.extend_from_slice(&[x / ww * 2.0 - 1.0, 1.0 - y / wh * 2.0, col[0], col[1], col[2], col[3]]);
+    out.extend_from_slice(&[x / ww * 2.0 - 1.0, 1.0 - y / wh * 2.0, col[0], col[1], col[2], col[3], 0.0, 0.0]);
+}
+
+/// Transforms only the drawing; touch areas and key dispatch remain independent.
+#[cfg(target_os = "android")]
+fn transform_touch_vertices(vertices: &mut [f32], center: (f32, f32), scale: f32, brightness: f32) {
+    let (cx, cy) = (center.0*2.0-1.0, 1.0-center.1*2.0);
+    for vertex in vertices.chunks_exact_mut(8) {
+        vertex[0] = cx + (vertex[0]-cx)*scale;
+        vertex[1] = cy + (vertex[1]-cy)*scale;
+        for value in &mut vertex[2..5] { *value *= brightness; }
+    }
+}
+
+/// Pushes a textured quad, used for the pixel-art control artwork. The colour is white, so the
+/// sprite comes through as drawn.
+#[cfg(target_os = "android")]
+fn push_sprite(
+    out: &mut Vec<f32>,
+    ww: f32,
+    wh: f32,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    u1: f32,
+    v1: f32,
+    u2: f32,
+    v2: f32,
+) {
+    let mut corner = |x: f32, y: f32, u: f32, v: f32| {
+        out.extend_from_slice(&[x / ww * 2.0 - 1.0, 1.0 - y / wh * 2.0, 1.0, 1.0, 1.0, 1.0, u, v]);
+    };
+    corner(x1, y1, u1, v1);
+    corner(x2, y1, u2, v1);
+    corner(x2, y2, u2, v2);
+    corner(x1, y1, u1, v1);
+    corner(x2, y2, u2, v2);
+    corner(x1, y2, u1, v2);
 }
 
 #[cfg(target_os = "android")]
@@ -935,12 +1517,19 @@ fn glyph(c: char) -> Option<[u8; 5]> {
         'M' => [0b101, 0b111, 0b111, 0b101, 0b101],
         'T' => [0b111, 0b010, 0b010, 0b010, 0b010],
         'L' => [0b100, 0b100, 0b100, 0b100, 0b111],
+        'R' => [0b110, 0b101, 0b110, 0b101, 0b101],
+        'U' => [0b101, 0b101, 0b101, 0b101, 0b011],
+        'D' => [0b110, 0b101, 0b101, 0b101, 0b110],
+        'G' => [0b011, 0b100, 0b101, 0b101, 0b011],
+        'I' => [0b111, 0b010, 0b010, 0b010, 0b111],
         '1' => [0b010, 0b110, 0b010, 0b010, 0b111],
         '2' => [0b110, 0b001, 0b010, 0b100, 0b111],
         '3' => [0b111, 0b001, 0b011, 0b001, 0b111],
         '4' => [0b101, 0b101, 0b111, 0b001, 0b001],
         '5' => [0b111, 0b100, 0b111, 0b001, 0b111],
         '6' => [0b011, 0b100, 0b111, 0b101, 0b111],
+        '7' => [0b111, 0b001, 0b010, 0b010, 0b010],
+        '-' => [0b000, 0b000, 0b111, 0b000, 0b000],
         _ => return None,
     })
 }
@@ -967,16 +1556,383 @@ fn push_text(out: &mut Vec<f32>, ww: f32, wh: f32, text: &str, cx: f32, cy: f32,
     }
 }
 
+// --- New overlay style: smooth, semi-transparent shapes. All geometry, so it stays crisp at any size
+// and needs no artwork.
+
+#[cfg(target_os = "android")]
+fn lerp_col(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    let t = t.clamp(0.0, 1.0);
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+        a[3] + (b[3] - a[3]) * t,
+    ]
+}
+
+#[cfg(target_os = "android")]
+fn with_alpha(mut col: [f32; 4], alpha: f32) -> [f32; 4] {
+    col[3] *= alpha;
+    col
+}
+
+/// The outline of a rounded rectangle, walked clockwise so it can be drawn as a fan from the centre.
+#[cfg(target_os = "android")]
+fn round_rect_outline(cx: f32, cy: f32, hw: f32, hh: f32, r: f32) -> Vec<(f32, f32)> {
+    const SEG: usize = 5;
+    let r = r.min(hw).min(hh).max(0.0);
+    let corners = [
+        (cx + hw - r, cy - hh + r, -90.0_f32),
+        (cx + hw - r, cy + hh - r, 0.0),
+        (cx - hw + r, cy + hh - r, 90.0),
+        (cx - hw + r, cy - hh + r, 180.0),
+    ];
+    let mut points = Vec::with_capacity(4 * (SEG + 1));
+    for (ax, ay, start) in corners {
+        for i in 0..=SEG {
+            let a = (start + 90.0 * i as f32 / SEG as f32).to_radians();
+            points.push((ax + r * a.cos(), ay + r * a.sin()));
+        }
+    }
+    points
+}
+
+/// A filled rounded rectangle with a vertical gradient (top colour down to bottom colour).
+#[cfg(target_os = "android")]
+fn push_round_rect(
+    out: &mut Vec<f32>,
+    ww: f32,
+    wh: f32,
+    cx: f32,
+    cy: f32,
+    hw: f32,
+    hh: f32,
+    r: f32,
+    top: [f32; 4],
+    bottom: [f32; 4],
+) {
+    if hw <= 0.0 || hh <= 0.0 {
+        return
+    }
+    let points = round_rect_outline(cx, cy, hw, hh, r);
+    let mid = lerp_col(top, bottom, 0.5);
+    let span = (2.0 * hh).max(0.0001);
+    let n = points.len();
+    for i in 0..n {
+        let (x0, y0) = points[i];
+        let (x1, y1) = points[(i + 1) % n];
+        let c0 = lerp_col(top, bottom, (y0 - (cy - hh)) / span);
+        let c1 = lerp_col(top, bottom, (y1 - (cy - hh)) / span);
+        push_vertex(out, ww, wh, cx, cy, mid);
+        push_vertex(out, ww, wh, x0, y0, c0);
+        push_vertex(out, ww, wh, x1, y1, c1);
+    }
+}
+
+/// A filled circle with a vertical gradient, for the joystick and the D-pad's centre.
+#[cfg(target_os = "android")]
+fn push_gradient_circle(out: &mut Vec<f32>, ww: f32, wh: f32, cx: f32, cy: f32, r: f32, top: [f32; 4], bottom: [f32; 4]) {
+    if r <= 0.0 {
+        return
+    }
+    const SEG: usize = 40;
+    let mid = lerp_col(top, bottom, 0.5);
+    let span = (2.0 * r).max(0.0001);
+    for i in 0..SEG {
+        let a0 = i as f32 / SEG as f32 * std::f32::consts::TAU;
+        let a1 = (i + 1) as f32 / SEG as f32 * std::f32::consts::TAU;
+        let (x0, y0) = (cx + r * a0.cos(), cy + r * a0.sin());
+        let (x1, y1) = (cx + r * a1.cos(), cy + r * a1.sin());
+        let c0 = lerp_col(top, bottom, (y0 - (cy - r)) / span);
+        let c1 = lerp_col(top, bottom, (y1 - (cy - r)) / span);
+        push_vertex(out, ww, wh, cx, cy, mid);
+        push_vertex(out, ww, wh, x0, y0, c0);
+        push_vertex(out, ww, wh, x1, y1, c1);
+    }
+}
+
+/// A round, soft button: shadow, light rim, gradient fill and its label.
+#[cfg(target_os = "android")]
+fn push_soft_button(
+    out: &mut Vec<f32>,
+    ww: f32,
+    wh: f32,
+    cx: f32,
+    cy: f32,
+    hw: f32,
+    hh: f32,
+    pressed: bool,
+    label: crate::touch_controls::Label,
+    opacity: f32,
+) {
+    let radius = hw.min(hh) * 0.44;
+    let shadow = with_alpha([0.0, 0.0, 0.0, 0.32], opacity);
+    let rim = with_alpha([1.0, 1.0, 1.0, 0.40], opacity);
+    let (top, bottom) = if pressed {
+        (with_alpha([1.0, 0.90, 0.35, 0.85], opacity), with_alpha([0.95, 0.60, 0.05, 0.85], opacity))
+    } else {
+        (with_alpha([0.20, 0.23, 0.34, 0.50], opacity), with_alpha([0.09, 0.10, 0.16, 0.34], opacity))
+    };
+    let ink = if pressed {
+        [0.16, 0.10, 0.0, 0.95]
+    } else {
+        with_alpha([0.97, 0.98, 1.0, 0.96], opacity)
+    };
+    // The shadow sits a touch lower and a touch bigger, so the button reads as floating.
+    push_round_rect(out, ww, wh, cx, cy + hh * 0.10, hw * 1.06, hh * 1.06, radius, shadow, shadow);
+    // The rim, then the fill on top of it.
+    push_round_rect(out, ww, wh, cx, cy, hw * 1.09, hh * 1.09, radius * 1.09, rim, rim);
+    push_round_rect(out, ww, wh, cx, cy, hw, hh, radius, top, bottom);
+    match label {
+        crate::touch_controls::Label::Text(text) => {
+            let len = text.chars().count().max(1) as f32;
+            let px = (hh * 0.46).min(hw * 1.5 / (len * 4.0)).max(1.0);
+            push_text(out, ww, wh, text, cx, cy, px, ink);
+        },
+        crate::touch_controls::Label::Arrow(dir) => push_arrow(out, ww, wh, cx, cy, hh * 0.5, dir, ink),
+        crate::touch_controls::Label::None => {},
+    }
+}
+
+/// The joystick of the new overlay: a soft translucent ring with a knob that follows the thumb.
+#[cfg(target_os = "android")]
+fn push_soft_joystick(out: &mut Vec<f32>, ww: f32, wh: f32, cx: f32, cy: f32, r: f32, ox: f32, oy: f32, opacity: f32) {
+    let shadow = with_alpha([0.0, 0.0, 0.0, 0.28], opacity);
+    let rim = with_alpha([1.0, 1.0, 1.0, 0.28], opacity);
+    let top = with_alpha([0.22, 0.25, 0.36, 0.44], opacity);
+    let bottom = with_alpha([0.09, 0.10, 0.16, 0.30], opacity);
+    push_gradient_circle(out, ww, wh, cx, cy + r * 0.05, r * 1.03, shadow, shadow);
+    push_gradient_circle(out, ww, wh, cx, cy, r, top, bottom);
+    push_ring(out, ww, wh, cx, cy, r, 3.0, rim);
+    let (kx, ky) = (cx + ox * r * 0.62, cy + oy * r * 0.62);
+    let kr = r * 0.42;
+    push_gradient_circle(
+        out,
+        ww,
+        wh,
+        kx,
+        ky,
+        kr,
+        with_alpha([0.82, 0.87, 1.0, 0.55], opacity),
+        with_alpha([0.52, 0.58, 0.85, 0.42], opacity),
+    );
+    push_ring(out, ww, wh, kx, ky, kr, 2.5, with_alpha([1.0, 1.0, 1.0, 0.50], opacity));
+}
+
+/// The D-pad of the new overlay: a soft translucent cross with four arrows.
+#[cfg(target_os = "android")]
+fn push_soft_dpad(out: &mut Vec<f32>, ww: f32, wh: f32, cx: f32, cy: f32, r: f32, opacity: f32) {
+    use crate::touch_controls::Dir;
+    let shadow = with_alpha([0.0, 0.0, 0.0, 0.26], opacity);
+    let rim = with_alpha([1.0, 1.0, 1.0, 0.32], opacity);
+    let top = with_alpha([0.20, 0.23, 0.34, 0.46], opacity);
+    let bottom = with_alpha([0.09, 0.10, 0.16, 0.32], opacity);
+    let arm = r * 1.02;
+    let thick = r * 0.38;
+    let radius = r * 0.30;
+    push_round_rect(out, ww, wh, cx, cy + r * 0.07, arm * 1.05, thick * 1.12, radius, shadow, shadow);
+    push_round_rect(out, ww, wh, cx, cy + r * 0.07, thick * 1.12, arm * 1.05, radius, shadow, shadow);
+    push_round_rect(out, ww, wh, cx, cy, arm * 1.05, thick * 1.10, radius, rim, rim);
+    push_round_rect(out, ww, wh, cx, cy, thick * 1.10, arm * 1.05, radius, rim, rim);
+    push_round_rect(out, ww, wh, cx, cy, arm, thick, radius * 0.95, top, bottom);
+    push_round_rect(out, ww, wh, cx, cy, thick, arm, radius * 0.95, top, bottom);
+    push_gradient_circle(out, ww, wh, cx, cy, thick * 0.92, top, bottom);
+    let ink = with_alpha([0.97, 0.98, 1.0, 0.95], opacity);
+    push_arrow(out, ww, wh, cx, cy - r * 0.62, r * 0.30, Dir::Up, ink);
+    push_arrow(out, ww, wh, cx, cy + r * 0.62, r * 0.30, Dir::Down, ink);
+    push_arrow(out, ww, wh, cx - r * 0.62, cy, r * 0.30, Dir::Left, ink);
+    push_arrow(out, ww, wh, cx + r * 0.62, cy, r * 0.30, Dir::Right, ink);
+}
+
+/// A modern control: a dark translucent disc with a soft rim, an inner ring and its label. Wide
+/// labels become a rounded pill instead of being squeezed into a circle.
+#[cfg(target_os = "android")]
+fn push_modern_control(
+    out: &mut Vec<f32>,
+    ww: f32,
+    wh: f32,
+    shape: crate::touch_controls::Shape,
+    pressed: bool,
+    aspect: Option<f32>,
+    tint: Option<[f32; 3]>,
+) -> (f32, f32, f32) {
+    let (cx, cy, r) = match shape {
+        crate::touch_controls::Shape::Circle { cx, cy, r } => (cx * ww, cy * wh, r * ww),
+        crate::touch_controls::Shape::Rect { cx, cy, w, h } => (cx * ww, cy * wh, (w * ww + h * wh) / 4.0),
+    };
+    let aspect = aspect.unwrap_or(1.0);
+    // The chosen colour multiplies the button greys, so the discs take its hue and stay translucent.
+    let t = tint.unwrap_or([1.0, 1.0, 1.0]);
+    let shade = |g: f32, a: f32| [t[0] * g, t[1] * g, t[2] * g, a];
+    let base = if pressed { shade(0.30, 0.50) } else { shade(0.20, 0.38) };
+    let groove = if pressed { shade(0.15, 0.54) } else { shade(0.115, 0.42) };
+    let raised = if pressed { shade(0.36, 0.48) } else { shade(0.26, 0.40) };
+    let inner = if pressed { shade(0.33, 0.50) } else { shade(0.235, 0.40) };
+    let ink = if pressed { [0.98, 0.98, 1.0, 0.98] } else { [0.62, 0.62, 0.65, 0.95] };
+    push_circle(out, ww, wh, cx, cy, r * 1.06, [0.0, 0.0, 0.0, 0.22]);
+    if (aspect - 1.0).abs() > 0.12 {
+        let hw = r * aspect;
+        push_round_rect(out, ww, wh, cx, cy, hw * 1.05, r * 1.05, r * 0.46, groove, groove);
+        push_round_rect(out, ww, wh, cx, cy, hw, r, r * 0.40, base, base);
+        push_round_rect(out, ww, wh, cx, cy, hw * 0.92, r * 0.92, r * 0.36, groove, groove);
+        push_round_rect(out, ww, wh, cx, cy, hw * 0.86, r * 0.86, r * 0.34, raised, raised);
+        push_round_rect(out, ww, wh, cx, cy, hw * 0.74, r * 0.74, r * 0.30, groove, groove);
+        push_round_rect(out, ww, wh, cx, cy, hw * 0.66, r * 0.66, r * 0.26, inner, inner);
+    } else {
+        push_circle(out, ww, wh, cx, cy, r, base);
+        push_ring(out, ww, wh, cx, cy, r * 0.92, (r * 0.05).max(2.0), groove);
+        push_ring(out, ww, wh, cx, cy, r * 0.82, (r * 0.055).max(2.0), raised);
+        push_ring(out, ww, wh, cx, cy, r * 0.70, (r * 0.04).max(2.0), groove);
+        push_circle(out, ww, wh, cx, cy, r * 0.62, inner);
+        push_ring(out, ww, wh, cx, cy, r * 0.995, (r * 0.02).max(1.0), shade(0.36, 0.20));
+    }
+    let _ = ink;
+    (cx, cy, r)
+}
+
+#[cfg(target_os = "android")]
+fn poly_dir(from: (f32, f32), to: (f32, f32)) -> (f32, f32) {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let len = (dx * dx + dy * dy).sqrt().max(0.0001);
+    (dx / len, dy / len)
+}
+
+/// The outline of a rounded cross, walked in order, so the D-pad reads as one clean shape.
+#[cfg(target_os = "android")]
+fn plus_points(cx: f32, cy: f32, arm: f32, thick: f32, radius: f32) -> Vec<(f32, f32)> {
+    let corners = [
+        (cx - thick, cy - arm), (cx + thick, cy - arm), (cx + thick, cy - thick), (cx + arm, cy - thick),
+        (cx + arm, cy + thick), (cx + thick, cy + thick), (cx + thick, cy + arm), (cx - thick, cy + arm),
+        (cx - thick, cy + thick), (cx - arm, cy + thick), (cx - arm, cy - thick), (cx - thick, cy - thick),
+    ];
+    let n = corners.len();
+    let mut points = Vec::with_capacity(n * 4);
+    for i in 0..n {
+        let p = corners[i];
+        let prev = corners[(i + n - 1) % n];
+        let next = corners[(i + 1) % n];
+        let d1 = poly_dir(p, prev);
+        let d2 = poly_dir(p, next);
+        let a = (p.0 + d1.0 * radius, p.1 + d1.1 * radius);
+        let b = (p.0 + d2.0 * radius, p.1 + d2.1 * radius);
+        for s in 0..=3 {
+            let t = s as f32 / 3.0;
+            let u = 1.0 - t;
+            points.push((u * u * a.0 + 2.0 * u * t * p.0 + t * t * b.0, u * u * a.1 + 2.0 * u * t * p.1 + t * t * b.1));
+        }
+    }
+    points
+}
+
+/// Fills a polygon as a fan from (cx, cy), with a vertical gradient.
+#[cfg(target_os = "android")]
+fn push_polygon(out: &mut Vec<f32>, ww: f32, wh: f32, points: &[(f32, f32)], cx: f32, cy: f32, top: [f32; 4], bottom: [f32; 4]) {
+    if points.len() < 3 {
+        return
+    }
+    let min_y = points.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
+    let max_y = points.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max);
+    let span = (max_y - min_y).max(0.0001);
+    let mid = lerp_col(top, bottom, 0.5);
+    for i in 0..points.len() {
+        let p0 = points[i];
+        let p1 = points[(i + 1) % points.len()];
+        let c0 = lerp_col(top, bottom, (p0.1 - min_y) / span);
+        let c1 = lerp_col(top, bottom, (p1.1 - min_y) / span);
+        push_vertex(out, ww, wh, cx, cy, mid);
+        push_vertex(out, ww, wh, p0.0, p0.1, c0);
+        push_vertex(out, ww, wh, p1.0, p1.1, c1);
+    }
+}
+
+/// The modern movement control: a clean translucent disc with a single rounded cross that lights up
+/// the arm being pressed, or a knob that follows the thumb (joystick).
+#[cfg(target_os = "android")]
+fn push_modern_movement(out: &mut Vec<f32>, ww: f32, wh: f32, cx: f32, cy: f32, r: f32, ox: f32, oy: f32, dpad: bool, tint: Option<[f32; 3]>) {
+    use crate::touch_controls::Dir;
+    let t = tint.unwrap_or([1.0, 1.0, 1.0]);
+    let shade = |g: f32, a: f32| [t[0] * g, t[1] * g, t[2] * g, a];
+    let disc = shade(0.21, 0.36);
+    let edge = shade(0.34, 0.18);
+    let outline = shade(0.10, 0.66);
+    let fill = shade(0.30, 0.55);
+    let ink = shade(0.62, 0.80);
+    push_circle(out, ww, wh, cx, cy, r * 1.05, [0.0, 0.0, 0.0, 0.18]);
+    push_circle(out, ww, wh, cx, cy, r, disc);
+    push_ring(out, ww, wh, cx, cy, r * 0.995, (r * 0.02).max(1.0), edge);
+    if dpad {
+        let arm = r * 0.74;
+        let thick = r * 0.255;
+        let radius = r * 0.13;
+        let border = r * 0.065;
+        // A slightly larger cross behind the fill gives a continuous dark outline: no stroke seams
+        // at the corners, which is what made the previous version look hatched.
+        let outer = plus_points(cx, cy, arm + border, thick + border, radius + border * 0.6);
+        push_polygon(out, ww, wh, &outer, cx, cy, outline, outline);
+        let points = plus_points(cx, cy, arm, thick, radius);
+        push_polygon(out, ww, wh, &points, cx, cy, fill, fill);
+        let dirs = crate::touch_controls::move_dirs();
+        let arms = [(0.0_f32, -1.0_f32), (0.0, 1.0), (-1.0, 0.0), (1.0, 0.0)];
+        // Light only the pressed arm, from its tip to the centre (never across it), then its arrow
+        // goes dark so it reads as pressed.
+        for (i, (dx, dy)) in arms.iter().enumerate() {
+            if !dirs[i] {
+                continue
+            }
+            // Fill the arm from its tip down to the edge of the central square, so it stops at the
+            // junction instead of reaching the centre.
+            let outer = (arm + thick) / 2.0;
+            let inner = (arm - thick) / 2.0;
+            let (ax, ay, hw, hh) = if *dx < 0.0 {
+                (cx - outer, cy, inner, thick)
+            } else if *dx > 0.0 {
+                (cx + outer, cy, inner, thick)
+            } else if *dy < 0.0 {
+                (cx, cy - outer, thick, inner)
+            } else {
+                (cx, cy + outer, thick, inner)
+            };
+            push_round_rect(out, ww, wh, ax, ay, hw, hh, radius * 0.8, [t[0]*0.5+0.5, t[1]*0.5+0.5, t[2]*0.5+0.5, 0.92], [t[0]*0.45+0.55, t[1]*0.45+0.55, t[2]*0.45+0.55, 0.92]);
+        }
+        for (i, (dx, dy)) in arms.iter().enumerate() {
+            let color = if dirs[i] { shade(0.14, 0.95) } else { ink };
+            let dir = match i {
+                0 => Dir::Up,
+                1 => Dir::Down,
+                2 => Dir::Left,
+                _ => Dir::Right,
+            };
+            push_arrow(out, ww, wh, cx + dx * r * 0.45, cy + dy * r * 0.45, r * 0.115, dir, color);
+        }
+    } else {
+        let (kx, ky) = (cx + ox * r * 0.52, cy + oy * r * 0.52);
+        let kr = r * 0.34;
+        push_circle(out, ww, wh, kx, ky, kr * 1.06, [0.0, 0.0, 0.0, 0.22]);
+        push_circle(out, ww, wh, kx, ky, kr, shade(0.27, 0.55));
+        push_ring(out, ww, wh, kx, ky, kr, (r * 0.04).max(2.0), shade(0.40, 0.50));
+    }
+}
+
 #[cfg(target_os = "android")]
 impl RendererImpl {
     /// Builds (once) the tiny program used to draw the touch controls over the frame.
     fn overlay_program(&mut self) -> Overlay {
         if let Some(o) = &self.overlay {
-            return Overlay { program: o.program, vao: o.vao, vbo: o.vbo }
+            return Overlay {
+                program: o.program,
+                vao: o.vao,
+                vbo: o.vbo,
+                white: o.white,
+                skin: o.skin,
+                slots: o.slots,
+                loc_tex: o.loc_tex,
+                party: o.party,
+                party_version: o.party_version,
+            }
         }
         unsafe {
-            let vs_src = b"#version 300 es\nlayout(location=0) in vec2 a_pos;\nlayout(location=1) in vec4 a_col;\nout vec4 v_col;\nvoid main(){ gl_Position = vec4(a_pos, 0.0, 1.0); v_col = a_col; }\0";
-            let fs_src = b"#version 300 es\nprecision mediump float;\nin vec4 v_col;\nout vec4 o_col;\nvoid main(){ o_col = v_col; }\0";
+            let vs_src = b"#version 300 es\nlayout(location=0) in vec2 a_pos;\nlayout(location=1) in vec4 a_col;\nlayout(location=2) in vec2 a_uv;\nout vec4 v_col;\nout vec2 v_uv;\nvoid main(){ gl_Position = vec4(a_pos, 0.0, 1.0); v_col = a_col; v_uv = a_uv; }\0";
+            let fs_src = b"#version 300 es\nprecision mediump float;\nin vec4 v_col;\nin vec2 v_uv;\nuniform sampler2D u_tex;\nout vec4 o_col;\nvoid main(){ o_col = v_col * texture(u_tex, v_uv); }\0";
             let vs = self.gl.CreateShader(gl::VERTEX_SHADER);
             self.gl.ShaderSource(vs, 1, &(vs_src.as_ptr() as *const GLchar), std::ptr::null());
             self.gl.CompileShader(vs);
@@ -1004,12 +1960,43 @@ impl RendererImpl {
             }
             self.gl.DeleteShader(vs);
             self.gl.DeleteShader(fs);
+            let loc_tex = self.gl.GetUniformLocation(program, b"u_tex\0".as_ptr().cast());
+
+            // A 1x1 white texture: the plain shapes carry their colour in the vertex, and sampling
+            // white leaves it untouched, so one shader covers both shapes and sprites.
+            let mut white = 0;
+            self.gl.GenTextures(1, &mut white);
+            self.gl.BindTexture(gl::TEXTURE_2D, white);
+            self.gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as _);
+            self.gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as _);
+            self.gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as _);
+            self.gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as _);
+            let white_pixel: [u8; 4] = [255, 255, 255, 255];
+            self.gl.TexImage2D(
+                gl::TEXTURE_2D,
+                0,
+                gl::RGBA as _,
+                1,
+                1,
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                white_pixel.as_ptr().cast(),
+            );
+
+            let (skin, slots) = load_skin(&self.gl);
+            load_label_skin(&self.gl);
+            let party = create_party_texture(&self.gl);
+
             let mut vao = 0;
             self.gl.GenVertexArrays(1, &mut vao);
             let mut vbo = 0;
             self.gl.GenBuffers(1, &mut vbo);
-            self.overlay = Some(Overlay { program, vao, vbo });
-            Overlay { program, vao, vbo }
+            // u64::MAX on purpose: it no longer matches the party's version, so the first frame
+            // fills the strip.
+            let fields = Overlay { program, vao, vbo, white, skin, slots, loc_tex, party, party_version: u64::MAX };
+            self.overlay = Some(fields);
+            fields
         }
     }
 
@@ -1020,59 +2007,185 @@ impl RendererImpl {
         if window_width == 0 || window_height == 0 {
             return
         }
-        let overlay = self.overlay_program();
+        let mut overlay = self.overlay_program();
         let (ww, wh) = (window_width as f32, window_height as f32);
 
+        // The party's sprites come from the game itself, so refill their strip when the party changes.
+        let party_version = touch_controls::party_version();
+        if overlay.party_version != party_version {
+            unsafe { upload_party(&self.gl, overlay.party, touch_controls::party_species()) };
+            overlay.party_version = party_version;
+            if let Some(stored) = self.overlay.as_mut() {
+                stored.party_version = party_version;
+            }
+        }
+
         let mut verts: Vec<f32> = Vec::new();
-        for (i, c) in touch_controls::CONTROLS.iter().enumerate() {
+        // Textured geometry (the pixel-art controls) goes in its own buffer, because it samples the
+        // artwork rather than the 1x1 white texture the plain shapes use.
+        let mut sprites: Vec<f32> = Vec::new();
+        // The party's sprites come from a texture of their own, so they travel in their own batch.
+        let mut party_sprites: Vec<f32> = Vec::new();
+        // The clean label atlas always travels in its own batch, because it is sampled with LINEAR.
+        let mut label_sprites: Vec<f32> = Vec::new();
+        let style = touch_controls::overlay_style();
+        let opacity = touch_controls::sprite_opacity();
+        let appearance = crate::touch_appearance::settings();
+        for (i, c) in touch_controls::controls().iter().enumerate() {
             if !touch_controls::is_active(i) {
                 continue
             }
+            // While the wheel is open it stands in for the button that opened it, so that button and
+            // its label get out of the way.
+            if touch_controls::wheel_open() && c.name == touch_controls::PARTY_NAME {
+                continue
+            }
             let pressed = touch_controls::is_pressed(i);
-            let (fill, border, ink) = if pressed {
-                ([1.0, 0.80, 0.10, 0.55], [1.0, 1.0, 0.70, 0.95], [0.10, 0.10, 0.10, 0.95])
-            } else {
-                ([0.10, 0.10, 0.16, 0.28], [1.0, 1.0, 1.0, 0.60], [1.0, 1.0, 1.0, 0.90])
+            let (visual_scale, brightness) = crate::touch_appearance::visual(i);
+            let plain_start = verts.len();
+            let sprite_start = sprites.len();
+            let center = match touch_controls::window_shape_for(i, ww, wh) {
+                touch_controls::Shape::Circle { cx, cy, .. } | touch_controls::Shape::Rect { cx, cy, .. } => (cx, cy),
             };
-            match c.shape {
-                touch_controls::Shape::Rect { cx, cy, w, h } => {
-                    let (cx, cy) = (cx * ww, cy * wh);
-                    let (w, h) = (w * ww, h * wh);
-                    let (x1, y1, x2, y2) = (cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0);
-                    push_quad(&mut verts, ww, wh, x1, y1, x2, y2, fill);
-                    let t = 3.0;
-                    push_quad(&mut verts, ww, wh, x1, y1, x2, y1 + t, border);
-                    push_quad(&mut verts, ww, wh, x1, y2 - t, x2, y2, border);
-                    push_quad(&mut verts, ww, wh, x1, y1, x1 + t, y2, border);
-                    push_quad(&mut verts, ww, wh, x2 - t, y1, x2, y2, border);
-                    if let touch_controls::Label::Arrow(dir) = c.label {
-                        push_arrow(&mut verts, ww, wh, cx, cy, h * 0.26, dir, ink);
+            // Moderno: the artwork we already had, drawn semi-transparent.
+            if appearance.style == crate::touch_appearance::Style::Modern {
+                if let Some(uv) = overlay.art(c.name) {
+                    let (cx, cy, half) = match touch_controls::window_shape_for(i, ww, wh) {
+                        touch_controls::Shape::Circle { cx, cy, r } => (cx * ww, cy * wh, r * ww),
+                        touch_controls::Shape::Rect { cx, cy, w, h } => (cx * ww, cy * wh, (w * ww + h * wh) / 4.0),
+                    };
+                    let aspect = overlay.art_aspect(c.name).unwrap_or(1.0);
+                    let (half_w, half_h) = (half * aspect, half);
+                    push_sprite(&mut sprites, ww, wh, cx - half_w, cy - half_h, cx + half_w, cy + half_h, uv[0], uv[1], uv[2], uv[3]);
+                    for v in sprites[sprite_start..].chunks_exact_mut(8) {
+                        v[5] *= touch_controls::sprite_opacity();
+                        if let Some(t) = appearance.tint {
+                            v[2] *= t[0];
+                            v[3] *= t[1];
+                            v[4] *= t[2];
+                        }
+                    }
+                    transform_touch_vertices(&mut sprites[sprite_start..], center, visual_scale, brightness);
+                    continue;
+                }
+            }
+            // Clasico: our soft discs, and the fallback for a Modern control without artwork.
+            let (lcx, lcy, lr) = push_modern_control(
+                &mut verts,
+                ww,
+                wh,
+                touch_controls::window_shape_for(i, ww, wh),
+                pressed,
+                touch_controls::control_art_aspect(c.name),
+                appearance.tint,
+            );
+            match c.label {
+                touch_controls::Label::Text(text) => {
+                    if let Some((uv, aspect)) = label_art(text) {
+                        push_label_sprite(&mut label_sprites, ww, wh, lcx, lcy, lr * 0.42, uv, aspect);
+                    } else {
+                        push_text(&mut verts, ww, wh, text, lcx, lcy, lr * 0.28, [0.72, 0.72, 0.76, 0.92]);
                     }
                 },
-                touch_controls::Shape::Circle { cx, cy, r } => {
-                    let (cx, cy, r) = (cx * ww, cy * wh, r * ww);
-                    push_circle(&mut verts, ww, wh, cx, cy, r, fill);
-                    push_ring(&mut verts, ww, wh, cx, cy, r, 3.0, border);
-                    if let touch_controls::Label::Text(text) = c.label {
-                        push_text(&mut verts, ww, wh, text, cx, cy, r * 0.24, ink);
-                    }
-                },
+                touch_controls::Label::Arrow(dir) => push_arrow(&mut verts, ww, wh, lcx, lcy, lr * 0.5, dir, [0.72, 0.72, 0.76, 0.92]),
+                touch_controls::Label::None => {},
+            }
+            transform_touch_vertices(&mut verts[plain_start..], center, visual_scale, brightness);
+        }
+        if !label_sprites.is_empty() {
+            let factor = touch_controls::sprite_opacity();
+            for v in label_sprites.chunks_exact_mut(8) {
+                v[5] *= factor;
             }
         }
 
-        // Movement joystick: base ring + knob that follows the thumb.
-        if touch_controls::joystick_active() {
-            let (cx, cy) = (touch_controls::JOYSTICK_CX * ww, touch_controls::JOYSTICK_CY * wh);
-            let r = touch_controls::JOYSTICK_R * wh;
-            push_circle(&mut verts, ww, wh, cx, cy, r, [0.10, 0.10, 0.16, 0.22]);
-            push_ring(&mut verts, ww, wh, cx, cy, r, 4.0, [1.0, 1.0, 1.0, 0.45]);
-            let (ox, oy) = touch_controls::joystick_offset();
-            let (kx, ky) = (cx + ox * r * 0.72, cy + oy * r * 0.72);
-            push_circle(&mut verts, ww, wh, kx, ky, r * 0.40, [0.85, 0.85, 0.92, 0.50]);
-            push_ring(&mut verts, ww, wh, kx, ky, r * 0.40, 3.0, [1.0, 1.0, 1.0, 0.75]);
+        if crate::field_controls::open(){
+            if let Some(uv)=overlay.art("field-selector"){
+                let(x,y,w,h)=crate::field_controls::rect(ww,wh);let start=sprites.len();
+                push_sprite(&mut sprites,ww,wh,x,y,x+w,y+h,uv[0],uv[1],uv[2],uv[3]);
+                for v in sprites[start..].chunks_exact_mut(8){v[5]*=touch_controls::sprite_opacity();}
+            }
+        }
+        // Movement joystick: the pixel-art base with the knob on top that follows the thumb, or the
+        // drawn ring when the artwork is not available.
+        if touch_controls::movement_active() {
+            let (jcx, jcy) = touch_controls::joystick_center_in_window(ww, wh);
+            let (cx, cy) = (jcx * ww, jcy * wh);
+            let r = touch_controls::joystick_radius() * wh;
+            let (ox, oy) = touch_controls::movement_offset();
+            let mut drew_sprite = false;
+            // Moderno draws the joystick artwork, semi-transparent.
+            if appearance.style == crate::touch_appearance::Style::Modern {
+                if let (Some(base), Some(knob)) = (overlay.art("joystick"), overlay.art("joystick-knob")) {
+                    let start = sprites.len();
+                    let half = r * 1.05;
+                    push_sprite(&mut sprites, ww, wh, cx - half, cy - half, cx + half, cy + half, base[0], base[1], base[2], base[3]);
+                    let (kx, ky) = (cx + ox * r * 0.72, cy + oy * r * 0.72);
+                    let kh = r * 0.88;
+                    push_sprite(&mut sprites, ww, wh, kx - kh, ky - kh, kx + kh, ky + kh, knob[0], knob[1], knob[2], knob[3]);
+                    for v in sprites[start..].chunks_exact_mut(8) {
+                        v[5] *= touch_controls::sprite_opacity();
+                        if let Some(t) = appearance.tint {
+                            v[2] *= t[0];
+                            v[3] *= t[1];
+                            v[4] *= t[2];
+                        }
+                    }
+                    drew_sprite = true;
+                }
+            }
+            if !drew_sprite {
+                push_modern_movement(
+                    &mut verts,
+                    ww,
+                    wh,
+                    cx,
+                    cy,
+                    r,
+                    ox,
+                    oy,
+                    touch_controls::move_mode() == touch_controls::MoveMode::Dpad,
+                    appearance.tint,
+                );
+            }
         }
 
-        if verts.is_empty() {
+        // Party wheel: the honeycomb artwork, each Pokémon of the team in its own hexagon and the
+        // selected border on whichever one the finger is pointing at.
+        if touch_controls::wheel_open() {
+            let species = touch_controls::party_species();
+            let (cx, cy) = touch_controls::wheel_center(ww, wh);
+            let radius = touch_controls::wheel_radius(ww, wh);
+            let selected = touch_controls::wheel_selected();
+            // Sized so the artwork's own hexagons land right where the slots are.
+            if let Some(uv) = overlay.art("selector") {
+                let half = radius / touch_controls::SELECTOR_SLOT_DISTANCE;
+                let tall = half * touch_controls::SELECTOR_ASPECT;
+                push_sprite(&mut sprites, ww, wh, cx - half, cy - tall, cx + half, cy + tall, uv[0], uv[1], uv[2], uv[3]);
+            }
+            let selection = overlay.art("selection");
+            let cell = 1.0 / touch_controls::PICKER_SLOTS as f32;
+            for index in 0..touch_controls::PICKER_SLOTS {
+                let (ix, iy) = touch_controls::wheel_item_center(index, ww, wh);
+                if species[index] != 0 {
+                    let x0 = index as f32 * cell;
+                    // Just inside the hexagon, so the sprite reads as sitting in it.
+                    let inner = radius * 0.42;
+                    push_sprite(&mut party_sprites, ww, wh, ix - inner, iy - inner, ix + inner, iy + inner, x0, 0.0, x0 + cell, 1.0);
+                }
+                if selected == index as i32 {
+                    // The border is one hexagon, sized to the artwork's own so it nests inside the
+                    // outline it draws.
+                    if let Some(uv) = selection {
+                        let wide = radius * 0.55;
+                        let tall = wide * 1.155;
+                        push_sprite(&mut sprites, ww, wh, ix - wide, iy - tall, ix + wide, iy + tall, uv[0], uv[1], uv[2], uv[3]);
+                    }
+                }
+            }
+        }
+
+        if verts.is_empty() && sprites.is_empty() && party_sprites.is_empty() && label_sprites.is_empty() {
             return
         }
         unsafe {
@@ -1101,12 +2214,39 @@ impl RendererImpl {
             gl.UseProgram(overlay.program);
             gl.BindVertexArray(overlay.vao);
             gl.BindBuffer(gl::ARRAY_BUFFER, overlay.vbo);
-            gl.BufferData(gl::ARRAY_BUFFER, (verts.len() * 4) as _, verts.as_ptr().cast(), gl::STREAM_DRAW);
+            gl.ActiveTexture(gl::TEXTURE0);
+            gl.Uniform1i(overlay.loc_tex, 0);
+            // x, y, r, g, b, a, u, v
+            const STRIDE: i32 = 32;
             gl.EnableVertexAttribArray(0);
-            gl.VertexAttribPointer(0, 2, gl::FLOAT, gl::FALSE, 24, std::ptr::null());
+            gl.VertexAttribPointer(0, 2, gl::FLOAT, gl::FALSE, STRIDE, std::ptr::null());
             gl.EnableVertexAttribArray(1);
-            gl.VertexAttribPointer(1, 4, gl::FLOAT, gl::FALSE, 24, 8 as *const std::ffi::c_void);
-            gl.DrawArrays(gl::TRIANGLES, 0, (verts.len() / 6) as i32);
+            gl.VertexAttribPointer(1, 4, gl::FLOAT, gl::FALSE, STRIDE, 8 as *const std::ffi::c_void);
+            gl.EnableVertexAttribArray(2);
+            gl.VertexAttribPointer(2, 2, gl::FLOAT, gl::FALSE, STRIDE, 24 as *const std::ffi::c_void);
+
+            // Plain shapes first (they sample the white pixel, so their colour passes through), then
+            // the pixel-art controls, which sample the artwork.
+            gl.BindTexture(gl::TEXTURE_2D, overlay.white);
+            gl.BufferData(gl::ARRAY_BUFFER, (verts.len() * 4) as _, verts.as_ptr().cast(), gl::STREAM_DRAW);
+            gl.DrawArrays(gl::TRIANGLES, 0, (verts.len() / 8) as i32);
+            if !sprites.is_empty() {
+                gl.BindTexture(gl::TEXTURE_2D, overlay.skin);
+                gl.BufferData(gl::ARRAY_BUFFER, (sprites.len() * 4) as _, sprites.as_ptr().cast(), gl::STREAM_DRAW);
+                gl.DrawArrays(gl::TRIANGLES, 0, (sprites.len() / 8) as i32);
+            }
+            if !label_sprites.is_empty() {
+                // The clean label atlas, sampled with LINEAR so the text stays smooth.
+                gl.BindTexture(gl::TEXTURE_2D, label_texture());
+                gl.BufferData(gl::ARRAY_BUFFER, (label_sprites.len() * 4) as _, label_sprites.as_ptr().cast(), gl::STREAM_DRAW);
+                gl.DrawArrays(gl::TRIANGLES, 0, (label_sprites.len() / 8) as i32);
+            }
+            if !party_sprites.is_empty() {
+                // The game's own sprites, which live in their own strip.
+                gl.BindTexture(gl::TEXTURE_2D, overlay.party);
+                gl.BufferData(gl::ARRAY_BUFFER, (party_sprites.len() * 4) as _, party_sprites.as_ptr().cast(), gl::STREAM_DRAW);
+                gl.DrawArrays(gl::TRIANGLES, 0, (party_sprites.len() / 8) as i32);
+            }
 
             gl.BindVertexArray(prev_vao as u32);
             gl.BindBuffer(gl::ARRAY_BUFFER, prev_vbo as u32);
@@ -1211,22 +2351,45 @@ impl RendererTrait for RendererImpl {
                     crate::util::bgra2rgba(pixels);
                 }
             }
-            for (atl_ref, pixels) in &sprites {
-                if self.current_atlas != atl_ref.atlas_id {
-                    self.gl.BindTexture(gl::TEXTURE_2D, textures[atl_ref.atlas_id as usize]);
-                    self.current_atlas = atl_ref.atlas_id;
+
+            // Compose and upload each atlas in a single batch to avoid thousands of small TexSubImage2D calls
+            for (atlas_idx, (packer, tex_id)) in packers.iter().zip(&textures).enumerate() {
+                let (atlas_w, atlas_h) = packer.size();
+                let mut atlas_buf = vec![0u8; (atlas_w * atlas_h * 4) as usize];
+
+                for (atl_ref, pixels) in &sprites {
+                    if atl_ref.atlas_id as usize == atlas_idx {
+                        let sw = atl_ref.w as usize;
+                        let sh = atl_ref.h as usize;
+                        let sx = atl_ref.x as usize;
+                        let sy = atl_ref.y as usize;
+                        let aw = atlas_w as usize;
+
+                        for row in 0..sh {
+                            let src_start = row * sw * 4;
+                            let src_end = src_start + sw * 4;
+                            let dst_start = ((sy + row) * aw + sx) * 4;
+                            let dst_end = dst_start + sw * 4;
+                            if src_end <= pixels.len() && dst_end <= atlas_buf.len() {
+                                atlas_buf[dst_start..dst_end].copy_from_slice(&pixels[src_start..src_end]);
+                            }
+                        }
+                    }
                 }
+
+                self.gl.BindTexture(gl::TEXTURE_2D, *tex_id);
+                self.current_atlas = atlas_idx as u32;
 
                 self.gl.TexSubImage2D(
                     gl::TEXTURE_2D,       // target
                     0,                    // level
-                    atl_ref.x as _,       // xoffset
-                    atl_ref.y as _,       // yoffset
-                    atl_ref.w as _,       // width
-                    atl_ref.h as _,       // height
+                    0,                    // xoffset
+                    0,                    // yoffset
+                    atlas_w as _,         // width
+                    atlas_h as _,         // height
                     if cfg!(target_os = "android") { gl::RGBA } else { gl::BGRA },
                     gl::UNSIGNED_BYTE,    // type
-                    pixels.as_ptr() as _, // pixels
+                    atlas_buf.as_ptr() as _, // pixels
                 );
             }
 
@@ -1389,6 +2552,18 @@ impl RendererTrait for RendererImpl {
         unsafe { self.imp.wait_vsync() }
     }
 
+    fn set_draw_offset(&mut self, x: f64, y: f64) {
+        let finite = |v: f64| {
+            let v = v as f32;
+            if v.is_finite() { v } else { 0.0 }
+        };
+        self.draw_offset = [finite(x), finite(y)];
+    }
+
+    fn set_interp_amount(&mut self, amount: f32) {
+        self.interp_amount = amount.clamp(0.0, 1.0);
+    }
+
     fn create_sprite_colour(&mut self, width: i32, height: i32, col: Colour) -> Result<AtlasRef, String> {
         let atlas_ref = self.create_surface(width, height, false)?;
         if let Some(rect) = self.get_rect(atlas_ref) {
@@ -1528,11 +2703,8 @@ impl RendererTrait for RendererImpl {
             self.gl.BindFramebuffer(gl::DRAW_FRAMEBUFFER, self.framebuffer.fbo);
 
             // reset view
-            let (mut fb_width, mut fb_height) = (0, 0);
-            self.gl.BindTexture(gl::TEXTURE_2D, self.framebuffer.texture);
-            self.gl.GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_WIDTH, &mut fb_width);
-            self.gl.GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_HEIGHT, &mut fb_height);
-            assert_eq!(self.gl.GetError(), 0);
+            let fb_width = self.framebuffer.width as i32;
+            let fb_height = self.framebuffer.height as i32;
             self.set_view(0, 0, fb_width, fb_height, 0.0, 0, 0, fb_width, fb_height);
         }
     }
@@ -1655,10 +2827,10 @@ impl RendererTrait for RendererImpl {
         unsafe {
             // get old size
             let old_tex = self.framebuffer.texture;
-            self.gl.BindTexture(gl::TEXTURE_2D, old_tex);
-            let (mut old_width, mut old_height) = (0, 0);
-            self.gl.GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_WIDTH, &mut old_width);
-            self.gl.GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_HEIGHT, &mut old_height);
+            let old_width = self.framebuffer.width as i32;
+            let old_height = self.framebuffer.height as i32;
+            self.framebuffer.width = width;
+            self.framebuffer.height = height;
             // set up new texture
             self.gl.GenTextures(1, &mut self.framebuffer.texture);
             self.gl.BindTexture(gl::TEXTURE_2D, self.framebuffer.texture);
@@ -1734,7 +2906,13 @@ impl RendererTrait for RendererImpl {
                     self.gl.DeleteTextures(1, &framebuffer.zbuf);
                     self.gl.DeleteFramebuffers(1, &framebuffer.fbo);
                 }
-                self.stored_framebuffer = Some(Framebuffer { texture: old_tex, zbuf: old_zbuf, fbo: old_fbo });
+                self.stored_framebuffer = Some(Framebuffer {
+                    texture: old_tex,
+                    zbuf: old_zbuf,
+                    fbo: old_fbo,
+                    width: old_width as u32,
+                    height: old_height as u32,
+                });
             } else {
                 // delete old texture and fbo
                 self.gl.DeleteTextures(1, &old_tex);
@@ -1774,11 +2952,17 @@ impl RendererTrait for RendererImpl {
             let mut prev_read_fbo: GLint = 0;
             self.gl.GetIntegerv(gl::READ_FRAMEBUFFER_BINDING, &mut prev_read_fbo);
 
-            // bind texture fbo
-            self.gl.BindFramebuffer(
-                gl::READ_FRAMEBUFFER,
-                self.fbo_ids[rect.atlas_id as usize].expect("Trying to dump nonexistent sprite"),
-            );
+            // bind texture fbo (the atlas may have been recreated during a scene change)
+            let Some(fbo) = self.fbo_ids.get(rect.atlas_id as usize).and_then(|fbo| *fbo) else {
+                return Box::new([])
+            };
+            self.gl.BindFramebuffer(gl::READ_FRAMEBUFFER, fbo);
+
+            // An incomplete framebuffer makes ReadPixels undefined and can stall the driver.
+            if self.gl.CheckFramebufferStatus(gl::READ_FRAMEBUFFER) != gl::FRAMEBUFFER_COMPLETE {
+                self.gl.BindFramebuffer(gl::READ_FRAMEBUFFER, prev_read_fbo as GLuint);
+                return Box::new([])
+            }
 
             // read data
             let len = (rect.w * rect.h * 4) as usize;
@@ -1786,11 +2970,13 @@ impl RendererTrait for RendererImpl {
             data.set_len(len);
             self.gl.ReadPixels(rect.x, rect.y, rect.w, rect.h, gl::RGBA, gl::UNSIGNED_BYTE, data.as_mut_ptr().cast());
 
-            assert_eq!(self.gl.GetError(), 0);
+            // A GL error here used to panic the game thread (the screen froze). The caller handles
+            // an empty buffer instead, and the error is left for the next frame to reset.
+            let _ = self.gl.GetError();
 
             // cleanup
             self.gl.BindFramebuffer(gl::READ_FRAMEBUFFER, prev_read_fbo as GLuint);
-            assert_eq!(self.gl.GetError(), 0);
+            let _ = self.gl.GetError();
 
             data.into_boxed_slice()
         }
@@ -1826,10 +3012,8 @@ impl RendererTrait for RendererImpl {
         let fb = self.stored_framebuffer.unwrap_or(self.framebuffer);
         unsafe {
             self.gl.BindTexture(gl::TEXTURE_2D, fb.zbuf);
-            let mut width = 0;
-            let mut height = 0;
-            self.gl.GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_WIDTH, &mut width);
-            self.gl.GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_HEIGHT, &mut height);
+            let width = fb.width as i32;
+            let height = fb.height as i32;
             let len = (width * height) as usize;
             let mut data: Vec<f32> = Vec::with_capacity(len);
             data.set_len(len);
@@ -1893,7 +3077,13 @@ impl RendererTrait for RendererImpl {
                 self.gl.DeleteFramebuffers(1, &framebuffer.fbo);
             }
 
-            self.stored_framebuffer = Some(Framebuffer { fbo, texture, zbuf: zbuffer });
+            self.stored_framebuffer = Some(Framebuffer {
+                fbo,
+                texture,
+                zbuf: zbuffer,
+                width: fb_w,
+                height: fb_h,
+            });
 
             assert_eq!(self.gl.GetError(), 0);
         }
@@ -2101,11 +3291,18 @@ impl RendererTrait for RendererImpl {
         let right: f64 = left + width;
         let bottom: f64 = top + height;
 
-        // get texture corners
-        let tex_left = f64::from(part_x) / f64::from(atlas_ref.w);
-        let tex_top = f64::from(part_y) / f64::from(atlas_ref.h);
-        let tex_right = tex_left + f64::from(part_w) / f64::from(atlas_ref.w);
-        let tex_bottom = tex_top + f64::from(part_h) / f64::from(atlas_ref.h);
+        // get texture corners.
+        // A negative part_w/part_h means the part is mirrored: its size is still |part_w|/|part_h|,
+        // but using the signed value put the UVs *outside* the sprite's atlas cell (0 .. -1), so the
+        // draw sampled whatever sat next to it in the atlas. The flip itself is already handled by
+        // the destination geometry (width/height carry the scale sign), so take the source extent as
+        // positive and just swap the corners each vertex samples.
+        let tex_x0 = f64::from(part_x) / f64::from(atlas_ref.w);
+        let tex_y0 = f64::from(part_y) / f64::from(atlas_ref.h);
+        let tex_x1 = tex_x0 + f64::from(part_w.abs()) / f64::from(atlas_ref.w);
+        let tex_y1 = tex_y0 + f64::from(part_h.abs()) / f64::from(atlas_ref.h);
+        let (tex_left, tex_right) = if part_w < 0.0 { (tex_x1, tex_x0) } else { (tex_x0, tex_x1) };
+        let (tex_top, tex_bottom) = if part_h < 0.0 { (tex_y1, tex_y0) } else { (tex_y0, tex_y1) };
 
         let (tex_left, tex_top, tex_right, tex_bottom) =
             (tex_left as f32, tex_top as f32, tex_right as f32, tex_bottom as f32);
@@ -2236,6 +3433,7 @@ impl RendererTrait for RendererImpl {
         self.setup_queue(self.white_pixel.atlas_id, PrimitiveShape::Point);
         self.vertex_queue.push(Vertex {
             pos: [x as f32, y as f32, self.depth],
+            interp: if self.interp_amount != 0.0 { self.draw_offset } else { [0.0, 0.0] },
             tex_coord: [f32::NAN; 2],
             blend: split_colour(colour, alpha),
             atlas_xywh: self.white_pixel.into(),
@@ -2576,15 +3774,15 @@ impl RendererTrait for RendererImpl {
         let mut fb_current = 0;
         unsafe {
             self.gl.GetIntegerv(gl::DRAW_FRAMEBUFFER_BINDING, &mut fb_current);
-            assert_eq!(self.gl.GetError(), 0);
+            debug_assert_eq!(self.gl.GetError(), 0);
         }
-        if fb_current == self.framebuffer.fbo as _ {
+        if fb_current == self.framebuffer.fbo as i32 {
             // Set viewport (gl::Viewport, gl::Scissor)
             if port_x >= 0 && port_y >= 0 && port_w >= 0 && port_h >= 0 {
                 unsafe {
                     self.gl.Viewport(port_x, port_y, port_w, port_h);
                     self.gl.Scissor(port_x, port_y, port_w, port_h);
-                    assert_eq!(self.gl.GetError(), 0);
+                    debug_assert_eq!(self.gl.GetError(), 0);
                 }
             }
         }
@@ -2600,7 +3798,7 @@ impl RendererTrait for RendererImpl {
         unsafe {
             self.gl.ClearColor(colour.r as f32, colour.g as f32, colour.b as f32, alpha as f32);
             self.gl.Clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
-            assert_eq!(self.gl.GetError(), 0);
+            debug_assert_eq!(self.gl.GetError(), 0);
         }
     }
 
@@ -2609,7 +3807,7 @@ impl RendererTrait for RendererImpl {
         unsafe {
             self.gl.ClearColor(colour.r as f32, colour.g as f32, colour.b as f32, alpha as f32);
             self.gl.Clear(gl::COLOR_BUFFER_BIT);
-            assert_eq!(self.gl.GetError(), 0);
+            debug_assert_eq!(self.gl.GetError(), 0);
         }
     }
 
@@ -2779,6 +3977,24 @@ impl RendererTrait for RendererImpl {
         self.render_state_updated = true;
     }
 
+    fn set_crt(&mut self, settings: Option<CrtSettings>) {
+        self.crt_settings = if self.crt.is_some() { settings } else { None };
+        if let Some(settings) = self.crt_settings {
+            eprintln!("[crt] activo: curvatura={} scanline={}", settings.curvature, settings.scanline);
+        }
+    }
+
+    fn set_gb(&mut self, settings: Option<GbSettings>) {
+        self.gb_settings = if self.crt.is_some() { settings } else { None };
+        if let Some(settings) = self.gb_settings {
+            eprintln!("[gb] activo: fuerza={} dither={}", settings.strength, settings.dither);
+        }
+    }
+
+    fn set_gb_inverted(&mut self, inverted: bool) {
+        self.gb_inverted = inverted;
+    }
+
     fn present(&mut self, window_width: u32, window_height: u32, scaling: Scaling) {
         if window_width == 0 || window_height == 0 {
             // if we continue, intel will dereference a null pointer
@@ -2789,40 +4005,46 @@ impl RendererTrait for RendererImpl {
             self.flush_queue();
 
             // Get framebuffer size
-            let (mut fb_width, mut fb_height) = (0, 0);
-            self.gl.BindTexture(gl::TEXTURE_2D, self.framebuffer.texture);
-            self.gl.GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_WIDTH, &mut fb_width);
-            self.gl.GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_HEIGHT, &mut fb_height);
+            let fb_width = self.framebuffer.width as i32;
+            let fb_height = self.framebuffer.height as i32;
 
             // yeah i know but they need to be converted anyway
             let (window_width_u, window_height_u) = (window_width, window_height);
             let (window_width, window_height) = (window_width as i32, window_height as i32);
 
-            // Scaling
-            let (w_x, w_y, w_w, w_h) = match scaling {
-                Scaling::Fixed(scale) => {
-                    let w = (f64::from(fb_width) * scale) as i32;
-                    let h = (f64::from(fb_height) * scale) as i32;
-                    ((window_width - w) / 2, (window_height - h) / 2, w, h)
-                },
-                Scaling::Aspect(_) => {
-                    if fb_width > 0 && fb_height > 0 {
-                        let fixed_width = window_height * fb_width / fb_height;
-                        if fixed_width < window_width {
-                            // window is too wide
-                            ((window_width - fixed_width) / 2, 0, fixed_width, window_height)
-                        } else {
-                            // window is too tall
-                            let fixed_height = window_width * fb_height / fb_width;
-                            (0, (window_height - fixed_height) / 2, window_width, fixed_height)
-                        }
-                    } else {
-                        // can never be too careful
-                        (0, 0, fb_width, fb_height)
+            // Where the game image lands, shared with the input mapping and the touch controls.
+            let (w_x, w_y, w_w, w_h) = crate::render::display_rect(
+                window_width_u,
+                window_height_u,
+                fb_width as u32,
+                fb_height as u32,
+                scaling,
+            );
+
+            // Where the game image lands on screen, so the controls that belong over it (the dialogue
+            // button) can be placed relative to the game instead of the window.
+            #[cfg(target_os = "android")]
+            if window_width > 0 && window_height > 0 {
+                crate::touch_controls::set_viewport(
+                    w_x as f32 / window_width as f32,
+                    w_y as f32 / window_height as f32,
+                    w_w as f32 / window_width as f32,
+                    w_h as f32 / window_height as f32,
+                );
+                // The launcher keeps its own loading screen until the game is really there. The first
+                // presented frame is not enough: the game paints a small "Loading…" screen of its own
+                // before the music starts, so the signal is the first sound being heard (with a
+                // generous fallback in case a device has no audio at all).
+                static READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                static FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if !READY.load(std::sync::atomic::Ordering::Relaxed) {
+                    let frames = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if crate::game::audio::sound_started() || frames > 900 {
+                        READY.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = std::fs::write(crate::android_main::storage_path("game-ready"), b"");
                     }
-                },
-                Scaling::Full => (0, 0, window_width, window_height),
-            };
+                }
+            }
 
             // On Intel, glBlitFrameBuffer just does nothing if the scissor box is too big, which it
             // very well could be. So just disable the scissor test for now.
@@ -2831,34 +4053,95 @@ impl RendererTrait for RendererImpl {
             // Remember old framebuffer so we can rebind it after we're done
             let mut fb_old = 0;
             self.gl.GetIntegerv(gl::DRAW_FRAMEBUFFER_BINDING, &mut fb_old);
-            assert_eq!(self.gl.GetError(), 0);
+            debug_assert_eq!(self.gl.GetError(), 0);
 
             // Draw framebuffer to screen
+            self.current_texture = None;
             self.gl.BindFramebuffer(gl::DRAW_FRAMEBUFFER, 0);
-            assert_eq!(self.gl.GetError(), 0);
+            debug_assert_eq!(self.gl.GetError(), 0);
             self.clear_view((0.0, 0.0, 0.0).into(), 1.0); // to avoid weird strobe lights (???)
-            assert_eq!(self.gl.GetError(), 0);
-            self.gl.BindFramebuffer(gl::READ_FRAMEBUFFER, self.framebuffer.fbo);
-            assert_eq!(self.gl.GetError(), 0);
-            self.gl.BlitFramebuffer(
-                0,
-                fb_height,
-                fb_width,
-                0,
-                w_x,
-                w_y,
-                w_x + w_w,
-                w_y + w_h,
-                gl::COLOR_BUFFER_BIT,
-                if self.next_render_state.interpolate_pixels.into() { gl::LINEAR } else { gl::NEAREST },
-            );
-            assert_eq!(self.gl.GetError(), 0);
+            debug_assert_eq!(self.gl.GetError(), 0);
+            // `display_rect` gives a rectangle in window coordinates, top-left origin (the same one
+            // the touches use). GL's origin is the bottom-left, so the vertical position is flipped
+            // here. For a full-height or centred rectangle the two agree, so only the keyboard inset
+            // - which anchors the game to the top - actually needs the flip.
+            let blit_y = window_height - w_y - w_h;
+            if (self.crt_settings.is_some() || self.gb_settings.is_some()) && self.crt.is_some() {
+                if w_w > 0 && w_h > 0 {
+                    let crt = self.crt.as_ref().expect("crt checked above");
+                    let settings = self.crt_settings.unwrap_or_else(CrtSettings::neutral);
+                    let gb = self.gb_settings.unwrap_or(GbSettings { strength: 0.0, ..GbSettings::default() });
+                    let blend_was_enabled = self.gl.IsEnabled(gl::BLEND) != 0;
+                    let depth_was_enabled = self.gl.IsEnabled(gl::DEPTH_TEST) != 0;
+                    self.gl.Disable(gl::BLEND);
+                    self.gl.Disable(gl::DEPTH_TEST);
+                    self.gl.Viewport(w_x, blit_y, w_w, w_h);
+                    self.gl.UseProgram(crt.program);
+                    self.gl.ActiveTexture(gl::TEXTURE0);
+                    self.gl.BindTexture(gl::TEXTURE_2D, self.framebuffer.texture);
+                    self.gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as _);
+                    self.gl.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as _);
+                    self.gl.Uniform1i(crt.loc_scene, 0);
+                    self.gl.Uniform2f(crt.loc_resolution, w_w as f32, w_h as f32);
+                    self.gl.Uniform1f(crt.loc_curvature, settings.curvature);
+                    self.gl.Uniform1f(crt.loc_scanline, settings.scanline);
+                    self.gl.Uniform1f(crt.loc_scanline_count, settings.scanline_count);
+                    self.gl.Uniform1f(crt.loc_mask, settings.mask);
+                    self.gl.Uniform1f(crt.loc_aberration, settings.aberration);
+                    self.gl.Uniform1f(crt.loc_vignette, settings.vignette);
+                    self.gl.Uniform1f(crt.loc_blur, settings.blur);
+                    self.gl.Uniform1f(crt.loc_noise, settings.noise);
+                    self.gl.Uniform1f(crt.loc_brightness, settings.brightness);
+                    self.gl.Uniform1f(crt.loc_saturation, settings.saturation);
+                    self.gl.Uniform1f(crt.loc_glow, settings.glow);
+                    self.gl.Uniform1f(crt.loc_corner, settings.corner);
+                    self.gl.Uniform1f(crt.loc_gb_strength, gb.strength);
+                    self.gl.Uniform1f(crt.loc_gb_dither, gb.dither);
+                    self.gl.Uniform1f(crt.loc_gb_contrast, gb.contrast);
+                    self.gl.Uniform1f(crt.loc_gb_brightness, gb.brightness);
+                    self.gl.Uniform1f(crt.loc_gb_invert, if self.gb_inverted { 1.0 } else { 0.0 });
+                    self.gl.BindVertexArray(crt.vao);
+                    self.gl.DrawArrays(gl::TRIANGLES, 0, 6);
+                    self.gl.BindVertexArray(self.vao);
+                    self.gl.UseProgram(self.program);
+                    if blend_was_enabled {
+                        self.gl.Enable(gl::BLEND);
+                    }
+                    if depth_was_enabled {
+                        self.gl.Enable(gl::DEPTH_TEST);
+                    }
+                    self.current_texture = None;
+                    debug_assert_eq!(self.gl.GetError(), 0);
+                }
+            } else {
+                self.gl.BindFramebuffer(gl::READ_FRAMEBUFFER, self.framebuffer.fbo);
+                debug_assert_eq!(self.gl.GetError(), 0);
+                self.gl.BlitFramebuffer(
+                    0,
+                    fb_height,
+                    fb_width,
+                    0,
+                    w_x,
+                    blit_y,
+                    w_x + w_w,
+                    blit_y + w_h,
+                    gl::COLOR_BUFFER_BIT,
+                    if cfg!(target_os = "android") {
+                        gl::NEAREST
+                    } else if self.next_render_state.interpolate_pixels.into() {
+                        gl::LINEAR
+                    } else {
+                        gl::NEAREST
+                    },
+                );
+                debug_assert_eq!(self.gl.GetError(), 0);
+            }
             self.gl.BindFramebuffer(gl::DRAW_FRAMEBUFFER, fb_old as u32);
-            assert_eq!(self.gl.GetError(), 0);
+            debug_assert_eq!(self.gl.GetError(), 0);
 
             self.gl.Enable(gl::SCISSOR_TEST);
 
-            assert_eq!(self.gl.GetError(), 0);
+            debug_assert_eq!(self.gl.GetError(), 0);
 
             // On-screen touch controls (Android): drawn on top of the presented frame.
             #[cfg(target_os = "android")]
@@ -2871,6 +4154,46 @@ impl RendererTrait for RendererImpl {
             // On Nvidia/AMD cards, unless the emulator is running in admin mode, if it is screenshared on Discord,
             // SwapBuffers will return TRUE i.e. no error, but glGetError will return GL_INVALID_OPERATION.
             // This hack evades the error, but a less awful solution would be really nice to have.
+            self.gl.GetError();
+        }
+    }
+
+    fn present_surface(&mut self, surface: AtlasRef, window_width: u32, window_height: u32) {
+        if window_width == 0 || window_height == 0 {
+            return
+        }
+        let Some(rect) = self.get_rect(surface) else { return };
+        let (sx, sy, sw, sh, atlas_id) = (rect.x, rect.y, rect.w, rect.h, rect.atlas_id);
+        let Some(Some(fbo)) = self.fbo_ids.get(atlas_id as usize) else { return };
+        let fbo = *fbo;
+        unsafe {
+            // Finish drawing the page into the surface.
+            self.flush_queue();
+            self.gl.Disable(gl::SCISSOR_TEST);
+            let mut fb_old = 0;
+            self.gl.GetIntegerv(gl::DRAW_FRAMEBUFFER_BINDING, &mut fb_old);
+            self.current_texture = None;
+            self.gl.BindFramebuffer(gl::DRAW_FRAMEBUFFER, 0);
+            self.gl.Viewport(0, 0, window_width as i32, window_height as i32);
+            self.gl.ClearColor(0.0, 0.0, 0.0, 1.0);
+            self.gl.Clear(gl::COLOR_BUFFER_BIT);
+            self.gl.BindFramebuffer(gl::READ_FRAMEBUFFER, fbo);
+            // The surface texture is bottom-up like the game's framebuffer, hence the flipped source.
+            self.gl.BlitFramebuffer(
+                sx,
+                sy + sh,
+                sx + sw,
+                sy,
+                0,
+                0,
+                window_width as i32,
+                window_height as i32,
+                gl::COLOR_BUFFER_BIT,
+                gl::NEAREST,
+            );
+            self.gl.BindFramebuffer(gl::DRAW_FRAMEBUFFER, fb_old as u32);
+            self.gl.Enable(gl::SCISSOR_TEST);
+            self.imp.swap_buffers();
             self.gl.GetError();
         }
     }
@@ -2889,17 +4212,15 @@ impl RendererTrait for RendererImpl {
 
         unsafe {
             // Get framebuffer size
-            let (mut fb_width, mut fb_height) = (0, 0);
-            self.gl.BindTexture(gl::TEXTURE_2D, framebuffer.texture);
-            self.gl.GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_WIDTH, &mut fb_width);
-            self.gl.GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_HEIGHT, &mut fb_height);
+            let fb_width = framebuffer.width as i32;
+            let fb_height = framebuffer.height as i32;
 
             let (width, height) = (w as i32, h as i32);
 
             // Remember old framebuffer so we can rebind it after we're done
             let mut fb_old = 0;
             self.gl.GetIntegerv(gl::DRAW_FRAMEBUFFER_BINDING, &mut fb_old);
-            assert_eq!(self.gl.GetError(), 0);
+            debug_assert_eq!(self.gl.GetError(), 0);
 
             // Draw framebuffer to screen
             self.gl.BindFramebuffer(gl::DRAW_FRAMEBUFFER, self.framebuffer.fbo);
@@ -2918,22 +4239,13 @@ impl RendererTrait for RendererImpl {
             );
             self.gl.BindFramebuffer(gl::DRAW_FRAMEBUFFER, fb_old as u32);
 
-            assert_eq!(self.gl.GetError(), 0);
+            debug_assert_eq!(self.gl.GetError(), 0);
         }
     }
 
     fn stored_size(&self) -> (u32, u32) {
         let framebuffer = self.stored_framebuffer.unwrap_or(self.framebuffer);
-        unsafe {
-            let (mut width, mut height) = (0, 0);
-            self.gl.BindTexture(gl::TEXTURE_2D, framebuffer.texture);
-            self.gl.GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_WIDTH, &mut width);
-            self.gl.GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_HEIGHT, &mut height);
-            (
-                u32::try_from(width).expect("Negative width reported by OpenGL"),
-                u32::try_from(height).expect("Negative height reported by OpenGL"),
-            )
-        }
+        (framebuffer.width, framebuffer.height)
     }
 
     fn finish(&mut self, window_width: u32, window_height: u32, clear_colour: Colour) {

@@ -14,17 +14,24 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Article
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.LightMode
+import androidx.compose.material.icons.filled.Language
+import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.LinkOff
+import androidx.compose.material.icons.filled.Opacity
 import androidx.compose.material.icons.filled.SportsEsports
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.SettingsBackupRestore
+import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.VideogameAsset
 import androidx.compose.material3.AlertDialog
@@ -35,21 +42,25 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
-import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.vectorResource
 import androidx.compose.ui.unit.dp
 import com.klisee.reloaded.GameRepository
+import com.klisee.reloaded.R
 import com.klisee.reloaded.Preferences
 import com.klisee.reloaded.Update
+import com.klisee.reloaded.discord.DiscordRpcManager
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -61,7 +72,11 @@ fun SettingsScreen(
     onLog: () -> Unit,
     onAbout: () -> Unit,
     onControls: () -> Unit,
+    onDiscord: () -> Unit,
+    onTouchSettings: () -> Unit,
+    onFpsSettings: () -> Unit,
     onMySaves: () -> Unit,
+    onMods: () -> Unit,
     onUpdateFound: (Update.Release) -> Unit,
     bottomBar: @Composable () -> Unit = {},
 ) {
@@ -71,12 +86,52 @@ fun SettingsScreen(
     var status by remember(revision) { mutableStateOf(repo.status()) }
     var keepScreenOn by remember { mutableStateOf(prefs.keepScreenOn) }
     var keepAspect by remember { mutableStateOf(prefs.keepAspect) }
+    var gameLanguage by remember { mutableStateOf(prefs.gameLanguage) }
+    var showLanguage by remember { mutableStateOf(false) }
+    val discordUser by DiscordRpcManager.user.collectAsState()
     var checking by remember { mutableStateOf(false) }
     val appVersion = remember {
         runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull().orEmpty()
     }
     var confirmingDelete by remember { mutableStateOf(false) }
     val installed = status as? GameRepository.Status.Ready
+
+    if (showLanguage) {
+        AlertDialog(
+            onDismissRequest = { showLanguage = false },
+            title = { Text("Seleccionar idioma") },
+            text = {
+                Column {
+                    listOf(
+                        "auto" to ("Automático" to "Según el idioma del teléfono"),
+                        "es" to ("Español" to "Texto del juego en español"),
+                        "en" to ("English" to "Game text and Rich Presence labels in English"),
+                    ).forEachIndexed { index, (mode, titleSubtitle) ->
+                        val (title, subtitle) = titleSubtitle
+                        ChoiceRow(
+                            icon = Icons.Filled.Language,
+                            title = title,
+                            subtitle = subtitle,
+                            selected = gameLanguage == mode,
+                            items = 3,
+                            index = index,
+                            onSelect = {
+                                gameLanguage = mode
+                                prefs.gameLanguage = mode
+                                Strings.update(prefs)
+                                if (installed != null) prefs.writeGameLanguage(context.filesDir)
+                                DiscordRpcManager.setLauncherScreen(
+                                    if (DiscordRpcManager.isEnglish()) "In Settings" else "En los Ajustes",
+                                )
+                                showLanguage = false
+                            },
+                        )
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showLanguage = false }) { Text("Cerrar") } },
+        )
+    }
 
     if (confirmingDelete) {
         AlertDialog(
@@ -133,6 +188,32 @@ fun SettingsScreen(
                 }
             }
 
+            SettingsGroup("Idioma") {
+                NavRow(
+                    icon = Icons.Filled.Language,
+                    title = "Seleccionar idioma",
+                    subtitle = when (gameLanguage) {
+                        "es" -> "Español"
+                        "en" -> "English"
+                        else -> "Automático"
+                    },
+                    items = 1,
+                    index = 0,
+                    onClick = { showLanguage = true },
+                )
+            }
+
+            SettingsGroup("Mods") {
+                NavRow(
+                    icon = Icons.Filled.Build,
+                    title = "Gestionar mods",
+                    subtitle = "Activa o desactiva los mods instalados",
+                    items = 1,
+                    index = 0,
+                    onClick = onMods,
+                )
+            }
+
             SettingsGroup("Partidas") {
                 NavRow(
                     icon = Icons.Filled.Save,
@@ -149,10 +230,21 @@ fun SettingsScreen(
                 )
             }
 
+            SettingsGroup("Controles tactiles") {
+                NavRow(
+                    icon = Icons.Filled.Tune,
+                    title = "Controles tactiles",
+                    subtitle = "Estilo, movimiento, transparencia y editores",
+                    items = 1,
+                    index = 0,
+                    onClick = onTouchSettings,
+                )
+            }
+
             SettingsGroup("Mando") {
                 NavRow(
                     icon = Icons.Filled.SportsEsports,
-                    title = "Controles",
+                    title = "Mando",
                     subtitle = "Elige que boton del mando hace cada tecla, y pruebalo",
                     items = 1,
                     index = 0,
@@ -189,6 +281,17 @@ fun SettingsScreen(
                 )
             }
 
+            SettingsGroup("FPS") {
+                NavRow(
+                    icon = Icons.Filled.Speed,
+                    title = "FPS",
+                    subtitle = "Modifica el framerate del juego a tu gusto, con frames mayores a 30 FPS",
+                    items = 1,
+                    index = 0,
+                    onClick = onFpsSettings,
+                )
+            }
+
             SettingsGroup("Pantalla") {
                 SwitchRow(
                     icon = Icons.Filled.LightMode,
@@ -201,6 +304,18 @@ fun SettingsScreen(
                         keepScreenOn = it
                         prefs.keepScreenOn = it
                     },
+                )
+            }
+
+            SettingsGroup("Discord") {
+                NavRow(
+                    icon = ImageVector.vectorResource(R.drawable.ic_discord),
+                    title = "Discord",
+                    subtitle = discordUser
+                        ?: if (prefs.discordEnabled) "Rich Presence activado" else "Conecta tu cuenta y muestra lo que juegas",
+                    items = 1,
+                    index = 0,
+                    onClick = onDiscord,
                 )
             }
 

@@ -9,7 +9,7 @@ use ramen::{connection::Connection, window::Window};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Scaling {
     /// Fixed scale, with a multiplier. The multiplier must always be strictly positive.
     Fixed(f64),
@@ -18,6 +18,74 @@ pub enum Scaling {
     Aspect(f64),
     /// Scale to fill window.
     Full,
+}
+
+/// Where the game image lands in the window: the rectangle the renderer blits into, and the one the
+/// input mapping has to invert. It lives in one place so the picture and the touches cannot drift
+/// apart. On Android, while the system keyboard is up the picture slides up - the way Android itself
+/// pans a window with a focused text field - just far enough to keep the text the game is editing
+/// above the keyboard.
+pub fn display_rect(
+    window_width: u32,
+    window_height: u32,
+    fb_width: u32,
+    fb_height: u32,
+    scaling: Scaling,
+) -> (i32, i32, i32, i32) {
+    let (window_width, window_height) = (window_width as i32, window_height as i32);
+    let (fb_width, fb_height) = (fb_width as i32, fb_height as i32);
+    let (x, y, w, h) = window_rect(window_width, window_height, fb_width, fb_height, scaling);
+    // The effective height: zero outside the game's text dialog, so a stale height cannot leave the
+    // picture stuck up top.
+    let inset = crate::touch_controls::text_entry_inset() as i32;
+    if inset <= 0 || window_height <= 0 || h <= 0 {
+        return (x, y, w, h)
+    }
+    // The keyboard is up. Scaling the game down to fit above it did leave the text on screen, but
+    // made it tiny; sliding the picture is what a phone does with a focused text field, and it
+    // keeps the game at the size the player chose.
+    //
+    // The game's text-entry modal has a fixed layout, so the bottom of the box it types into sits at
+    // a fixed fraction of the picture: that is what has to clear the keyboard.
+    const TEXT_BOTTOM: f64 = 0.42;
+    /// A little air between the text and the keyboard, as a fraction of the window height.
+    const COMFORT: f64 = 0.06;
+    let usable = (window_height - inset).max(1);
+    let text_bottom = y + (f64::from(h) * TEXT_BOTTOM).round() as i32;
+    let wanted = text_bottom - usable + (f64::from(window_height) * COMFORT).round() as i32;
+    // Never so far that the picture's top shows a gap at the bottom, and never so far that the text
+    // would leave the screen upwards.
+    let limit = (h - usable).min(text_bottom).max(0);
+    let pan = wanted.clamp(0, limit);
+    (x, y - pan, w, h)
+}
+
+/// The game image's rectangle with the whole window to itself, whichever scaling mode is in use.
+fn window_rect(window_width: i32, window_height: i32, fb_width: i32, fb_height: i32, scaling: Scaling) -> (i32, i32, i32, i32) {
+    match scaling {
+        Scaling::Fixed(scale) => {
+            let w = (f64::from(fb_width) * scale) as i32;
+            let h = (f64::from(fb_height) * scale) as i32;
+            ((window_width - w) / 2, (window_height - h) / 2, w, h)
+        },
+        Scaling::Aspect(_) => {
+            if fb_width > 0 && fb_height > 0 {
+                let fixed_width = window_height * fb_width / fb_height;
+                if fixed_width < window_width {
+                    // window is too wide
+                    ((window_width - fixed_width) / 2, 0, fixed_width, window_height)
+                } else {
+                    // window is too tall
+                    let fixed_height = window_width * fb_height / fb_width;
+                    (0, (window_height - fixed_height) / 2, window_width, fixed_height)
+                }
+            } else {
+                // can never be too careful
+                (0, 0, fb_width, fb_height)
+            }
+        },
+        Scaling::Full => (0, 0, window_width, window_height),
+    }
 }
 
 /// The video mode the launcher pinned through the environment, if any.
@@ -36,6 +104,52 @@ pub fn pinned_scaling() -> Option<Scaling> {
     }
 }
 
+/// How the game is presented when the room runs slower than the screen.
+///
+/// The game itself always steps at its room speed. `Auto` and `Uncapped` decouple drawing from that
+/// step and interpolate instance positions, so the picture can run at the screen's rate while the
+/// simulation keeps its original timing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderMode {
+    /// One drawn frame per game step, exactly like the original runner.
+    Native,
+    /// Draw as fast as the display lets us (vsync), interpolating between game steps.
+    Auto,
+    /// Interpolate but pace drawing to a fixed number of frames per second. Useful when vsync is
+    /// not honoured by the driver and the display's native rate is known.
+    Fixed(u32),
+    /// Do not wait for anything; draw as fast as the device can.
+    Uncapped,
+}
+
+impl RenderMode {
+    pub fn interpolates(self) -> bool {
+        !matches!(self, RenderMode::Native)
+    }
+}
+
+/// The display refresh rate the launcher detected, used as a ceiling for `Auto` when vsync does
+/// not actually pace the swap.
+pub fn pinned_render_hz() -> Option<u32> {
+    let value = std::env::var("OPENGMK_RENDER_HZ").ok()?;
+    value.trim().parse::<u32>().ok().filter(|hz| *hz > 0).map(|hz| hz.min(1000))
+}
+
+/// The render rate the launcher pinned through the environment, if any. Absent means `Native`.
+pub fn pinned_render_mode() -> RenderMode {
+    let value = std::env::var("OPENGMK_RENDER").unwrap_or_default();
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "auto" => RenderMode::Auto,
+        "uncapped" | "unlimited" | "max" => RenderMode::Uncapped,
+        // A number is a fixed cap, for drivers where vsync does not actually pace the swap.
+        other => match other.parse::<u32>() {
+            Ok(fps) if fps > 0 => RenderMode::Fixed(fps.min(1000)),
+            _ => RenderMode::Native,
+        },
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedTexture {
     width: i32,
@@ -49,6 +163,82 @@ pub struct Fog {
     pub colour: i32,
     pub begin: f32,
     pub end: f32,
+}
+
+/// Optional CRT-style post-process applied to the entire presented frame.
+///
+/// Values are deliberately plain floats so they can be read from a mod's `mod.ini` without pulling
+/// the renderer into the mod loader's data model.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CrtSettings {
+    pub curvature: f32,
+    pub scanline: f32,
+    /// Number of scanline bands over the height of the picture. Kept independent of the window
+    /// resolution so a fullscreen picture has the same CRT texture as a windowed one.
+    pub scanline_count: f32,
+    pub mask: f32,
+    pub aberration: f32,
+    pub vignette: f32,
+    pub blur: f32,
+    pub noise: f32,
+    pub brightness: f32,
+    pub saturation: f32,
+    pub glow: f32,
+    pub corner: f32,
+}
+
+impl Default for CrtSettings {
+    fn default() -> Self {
+        Self {
+            curvature: 0.055,
+            scanline: 0.40,
+            scanline_count: 360.0,
+            mask: 0.60,
+            aberration: 0.0035,
+            vignette: 0.35,
+            blur: 0.0,
+            noise: 0.014,
+            brightness: 1.18,
+            saturation: 1.08,
+            glow: 0.15,
+            corner: 0.07,
+        }
+    }
+}
+
+impl CrtSettings {
+    /// A no-op CRT setup, used when only another post-process (Game Boy palette) is active.
+    pub fn neutral() -> Self {
+        Self {
+            curvature: 0.0,
+            scanline: 0.0,
+            scanline_count: 0.0,
+            mask: 0.0,
+            aberration: 0.0,
+            vignette: 0.0,
+            blur: 0.0,
+            noise: 0.0,
+            brightness: 1.0,
+            saturation: 1.0,
+            glow: 0.0,
+            corner: 0.0,
+        }
+    }
+}
+
+/// The four-shade, low-colour Game Boy look.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GbSettings {
+    pub strength: f32,
+    pub dither: f32,
+    pub contrast: f32,
+    pub brightness: f32,
+}
+
+impl Default for GbSettings {
+    fn default() -> Self {
+        Self { strength: 1.0, dither: 0.25, contrast: 0.90, brightness: 1.02 }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -114,8 +304,17 @@ impl From<PrimitiveType> for PrimitiveShape {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[repr(C)]
 struct Vertex {
     pub pos: [f32; 3],
+    /// How far this vertex was from where it should be, in world pixels, when it was submitted.
+    ///
+    /// The shader subtracts this by `interp_amount`, so the same frame can be presented at any point
+    /// between the previous game step and the current one without touching the game state.
+    ///
+    /// Render-only data: keeping it out of savestates also keeps old savestates loadable.
+    #[serde(skip)]
+    pub interp: [f32; 2],
     pub tex_coord: [f32; 2],
     pub blend: [f32; 4],
     pub atlas_xywh: [f32; 4],
@@ -166,8 +365,18 @@ impl PrimitiveBuilder {
     }
 
     fn push_vertex(&mut self, pos: [f32; 3], tex_coord: [f32; 2], blend: [f32; 4], normal: [f32; 3]) -> &mut Self {
-        let tex_coord = if self.textured { tex_coord } else { [f32::NAN; 2] };
-        self.push_vertex_raw(Vertex { pos, tex_coord, blend, normal, atlas_xywh: self.atlas_ref.into() });
+        // -1 marks an untextured primitive. NaN used to be the marker, but mobile GPUs (and their
+        // interpolators) are allowed to flush it, which turned the texture coordinate into a real
+        // sample and made every filled primitive -- the characters' shadows included -- vanish.
+        let tex_coord = if self.textured { tex_coord } else { [-1.0; 2] };
+        self.push_vertex_raw(Vertex {
+            pos,
+            interp: [0.0, 0.0],
+            tex_coord,
+            blend,
+            normal,
+            atlas_xywh: self.atlas_ref.into(),
+        });
         self
     }
 
@@ -216,6 +425,13 @@ pub trait RendererTrait {
     fn set_vsync(&self, vsync: bool);
     fn get_vsync(&self) -> bool;
     fn wait_vsync(&self);
+
+    /// Sets the interpolation offset applied to every vertex submitted from now on. Call it before
+    /// each instance's draw event and reset it to zero afterwards.
+    fn set_draw_offset(&mut self, x: f64, y: f64);
+    /// How much of each vertex's interpolation offset to apply: 0 shows the current step, 1 shows
+    /// the previous one.
+    fn set_interp_amount(&mut self, amount: f32);
 
     fn get_rect(&self, id: AtlasRef) -> Option<&AtlasRect>;
 
@@ -337,7 +553,13 @@ pub trait RendererTrait {
         port_h: i32,
     );
     fn flush_queue(&mut self);
+    fn set_crt(&mut self, _settings: Option<CrtSettings>) {}
+    fn set_gb(&mut self, _settings: Option<GbSettings>) {}
+    fn set_gb_inverted(&mut self, _inverted: bool) {}
     fn present(&mut self, window_width: u32, window_height: u32, scaling: Scaling);
+    /// Presents one surface, stretched over the whole window. Used by the game's information window,
+    /// which is drawn at window resolution instead of the game's small framebuffer.
+    fn present_surface(&mut self, surface: AtlasRef, window_width: u32, window_height: u32);
     fn draw_stored(&mut self, target_x: i32, target_y: i32, width: u32, height: u32);
     fn stored_size(&self) -> (u32, u32);
     fn finish(&mut self, window_width: u32, window_height: u32, clear_colour: Colour);
@@ -626,6 +848,14 @@ impl Renderer {
         self.0.wait_vsync()
     }
 
+    pub fn set_draw_offset(&mut self, x: f64, y: f64) {
+        self.0.set_draw_offset(x, y)
+    }
+
+    pub fn set_interp_amount(&mut self, amount: f32) {
+        self.0.set_interp_amount(amount)
+    }
+
     pub fn draw_sprite(
         &mut self,
         texture: AtlasRef,
@@ -637,7 +867,49 @@ impl Renderer {
         colour: i32,
         alpha: f64,
     ) {
+        self.note_character_sprite(texture, x, y, xscale, yscale);
         self.0.draw_sprite(texture, x, y, xscale, yscale, angle, colour, alpha)
+    }
+
+    /// Notes a drawn sprite when it is big enough to be one of the character picker's characters.
+    ///
+    /// The overlay puts that screen's arrows beside the character, and the only thing that knows where
+    /// the character ended up is the game's own drawing: every sprite passes through here, whichever
+    /// of the draw functions the game used.
+    fn note_character_sprite(&self, texture: AtlasRef, x: f64, y: f64, xscale: f64, yscale: f64) {
+        let Some(rect) = self.0.get_rect(texture) else { return };
+        // A sprite is drawn from its origin, which is not always its centre - the picker's characters
+        // are anchored elsewhere, and assuming the centre put the box somewhere the character is not.
+        // The origin is a fraction of the sprite's own size, and the scale is signed: a mirrored
+        // sprite flips around it.
+        let (w, h) = (f64::from(rect.w) * xscale, f64::from(rect.h) * yscale);
+        let (left, top) = (x - f64::from(rect.origin_x) * w, y - f64::from(rect.origin_y) * h);
+        self.note_character_box(left.min(left + w), top.min(top + h), left.max(left + w), top.max(top + h));
+    }
+
+    fn note_character_box(&self, x1: f64, y1: f64, x2: f64, y2: f64) {
+        let (half_w, half_h) = ((x2 - x1).abs() / 2.0, (y2 - y1).abs() / 2.0);
+        let (picture_width, picture_height) = self.0.stored_size();
+        // On the picture: the game also draws sprites parked far outside it (the picker's room has a
+        // couple, and they move, which would drag the box along with them).
+        let on_picture = x1 >= 0.0
+            && y1 >= 0.0
+            && x2 <= f64::from(picture_width)
+            && y2 <= f64::from(picture_height);
+        // A quarter of the picture tall at least: the characters take about half of it, while the
+        // little cursor under each name is far smaller. And no more than half of it either way: the
+        // room's background is the whole picture, and it would swallow everything else. The width cap
+        // is what keeps the arrows on the character: without it, a wide sprite on those screens - the
+        // one behind the name, the glow around the chosen one - took the box and the arrows went with
+        // it, away from the character.
+        let (w, h) = ((x2 - x1).abs(), (y2 - y1).abs());
+        let character_sized = on_picture
+            && h >= f64::from(picture_height) / 4.0
+            && w <= f64::from(picture_width) * 0.5
+            && h <= f64::from(picture_height) * 0.5;
+        if character_sized {
+            crate::touch_controls::note_sprite(x1, y1, x2, y2);
+        }
     }
 
     pub fn draw_sprite_colour(
@@ -654,6 +926,7 @@ impl Renderer {
         col4: i32,
         alpha: f64,
     ) {
+        self.note_character_sprite(tex, x, y, xs, ys);
         self.0.draw_sprite_colour(tex, x, y, xs, ys, ang, col1, col2, col3, col4, alpha)
     }
 
@@ -676,6 +949,7 @@ impl Renderer {
         alpha: f64,
         use_origin: bool,
     ) {
+        self.note_character_sprite(texture, x, y, xscale, yscale);
         self.0.draw_sprite_general(
             texture, part_x, part_y, part_w, part_h, x, y, xscale, yscale, angle, col1, col2, col3, col4, alpha,
             use_origin,
@@ -1153,8 +1427,24 @@ impl Renderer {
         self.0.set_light(id, light)
     }
 
+    pub fn set_crt(&mut self, settings: Option<CrtSettings>) {
+        self.0.set_crt(settings)
+    }
+
+    pub fn set_gb(&mut self, settings: Option<GbSettings>) {
+        self.0.set_gb(settings)
+    }
+
+    pub fn set_gb_inverted(&mut self, inverted: bool) {
+        self.0.set_gb_inverted(inverted)
+    }
+
     pub fn present(&mut self, window_width: u32, window_height: u32, scaling: Scaling) {
         self.0.present(window_width, window_height, scaling)
+    }
+
+    pub fn present_surface(&mut self, surface: AtlasRef, window_width: u32, window_height: u32) {
+        self.0.present_surface(surface, window_width, window_height)
     }
 
     pub fn draw_stored(&mut self, target_x: i32, target_y: i32, width: u32, height: u32) {
@@ -1197,6 +1487,58 @@ impl Renderer {
         }
     }
 
+    /// The part of the renderer state that draw events can touch. Cheaper than [`state`], which
+    /// also snapshots every atlas rect for savestates and would be wasteful on every extra frame.
+    pub fn draw_state(&self) -> DrawState {
+        DrawState {
+            model_matrix: self.get_model_matrix(),
+            alpha_blending: self.get_alpha_blending(),
+            colour_blending: self.get_colour_blending(),
+            blend_mode: self.get_blend_mode(),
+            pixel_interpolation: self.get_pixel_interpolation(),
+            texture_repeat: self.get_texture_repeat(),
+            ambient_colour: self.get_ambient_colour(),
+            using_3d: self.get_3d(),
+            depth: self.get_depth(),
+            depth_test: self.get_depth_test(),
+            write_depth: self.get_write_depth(),
+            culling: self.get_culling(),
+            perspective: self.get_perspective(),
+            fog: self.get_fog(),
+            gouraud: self.get_gouraud(),
+            lighting_enabled: self.get_lighting_enabled(),
+            lights: self.get_lights(),
+            circle_precision: self.get_circle_precision(),
+            primitive_2d: self.get_primitive_2d(),
+            primitive_3d: self.get_primitive_3d(),
+            zbuf_trashed: self.get_zbuf_trashed(),
+        }
+    }
+
+    pub fn restore_draw_state(&mut self, state: &DrawState) {
+        self.set_model_matrix(state.model_matrix);
+        self.set_alpha_blending(state.alpha_blending);
+        self.set_colour_blending(state.colour_blending);
+        self.set_blend_mode(state.blend_mode.0, state.blend_mode.1);
+        self.set_pixel_interpolation(state.pixel_interpolation);
+        self.set_texture_repeat(state.texture_repeat);
+        self.set_ambient_colour(state.ambient_colour);
+        self.set_3d(state.using_3d);
+        self.set_depth(state.depth);
+        self.set_depth_test(state.depth_test);
+        self.set_write_depth(state.write_depth);
+        self.set_culling(state.culling);
+        self.set_perspective(state.perspective);
+        self.set_fog(state.fog.clone());
+        self.set_gouraud(state.gouraud);
+        self.set_lighting_enabled(state.lighting_enabled);
+        self.set_lights(state.lights);
+        self.set_circle_precision(state.circle_precision);
+        self.set_primitive_2d(state.primitive_2d.clone());
+        self.set_primitive_3d(state.primitive_3d.clone());
+        self.set_zbuf_trashed(state.zbuf_trashed);
+    }
+
     pub fn set_state(&mut self, state: &RendererState) {
         self.set_model_matrix(state.model_matrix);
         self.set_alpha_blending(state.alpha_blending);
@@ -1236,6 +1578,33 @@ pub struct RendererState {
     pub texture_repeat: bool,
     pub texture_rects: Vec<Option<AtlasRect>>,
     pub vsync: bool,
+    pub ambient_colour: i32,
+    pub using_3d: bool,
+    pub depth: f32,
+    pub depth_test: bool,
+    pub write_depth: bool,
+    pub culling: bool,
+    pub perspective: bool,
+    pub fog: Option<Fog>,
+    pub gouraud: bool,
+    pub lighting_enabled: bool,
+    pub lights: [(bool, Light); 8],
+    pub circle_precision: i32,
+    pub primitive_2d: PrimitiveBuilder,
+    pub primitive_3d: PrimitiveBuilder,
+    pub zbuf_trashed: bool,
+}
+
+/// The renderer state an extra (interpolated) draw pass has to put back afterwards. It leaves out
+/// texture rects and vsync, which drawing never changes and which are expensive to copy.
+#[derive(Clone, Debug)]
+pub struct DrawState {
+    pub model_matrix: [f32; 16],
+    pub alpha_blending: bool,
+    pub colour_blending: bool,
+    pub blend_mode: (BlendType, BlendType),
+    pub pixel_interpolation: bool,
+    pub texture_repeat: bool,
     pub ambient_colour: i32,
     pub using_3d: bool,
     pub depth: f32,

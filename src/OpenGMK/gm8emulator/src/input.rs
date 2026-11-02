@@ -1179,6 +1179,22 @@ impl Input {
     }
 
     /// Queues a simulated key press, to be applied on the next event poll.
+    /// Sets a synthetic key state (used by the online battle input bridge). This updates
+    /// press/release edges as well as the held state, so menu code sees the same transitions.
+    pub fn set_key_state(&mut self, key: u8, pressed: bool) {
+        let index = key as usize;
+        if index >= self.button_state.len() {
+            return
+        }
+        let was_pressed = self.button_state[index];
+        self.button_state[index] = pressed;
+        if pressed && !was_pressed {
+            self.button_state_press[index] = true;
+        } else if !pressed && was_pressed {
+            self.button_state_release[index] = true;
+        }
+    }
+
     pub fn keyboard_key_press(&mut self, key: i32) {
         if let Ok(vk) = u8::try_from(key) {
             self.pending_input.push((vk, true));
@@ -1515,16 +1531,16 @@ impl Input {
         self.mouse_position_previous.1
     }
 
-    /// Clears the button press and release buffers.
-    /// Should be called after each frame.
+    /// Clears the button press/release buffers and the wheel latch after a game step.
+    /// Should be called after each game step, not after each rendered frame.
     pub fn step(&mut self) {
         self.button_state_press.iter_mut().for_each(|x| *x = false);
         self.button_state_release.iter_mut().for_each(|x| *x = false);
+        self.mouse_wheel = (false, false);
     }
 
     pub fn mouse_step(&mut self) {
         self.mouse_position_previous = self.mouse_position;
-        self.mouse_wheel = (false, false);
     }
 
     /// Hard reset, clearing all state.
@@ -1539,6 +1555,16 @@ mod tests {
 
     /// A click whose down and up land in the same poll must still be observable as held for that
     /// poll, otherwise the game's blocking modal dialogs spin forever. See `defer_release`.
+    #[test]
+    fn wheel_survives_render_polls_until_the_next_game_step() {
+        let mut input = Input::new();
+        input.mouse_scroll_down();
+        input.mouse_step();
+        assert!(input.mouse_wheel_down(), "a render frame must not eat a wheel notch");
+        input.step();
+        assert!(!input.mouse_wheel_down(), "the game step consumes it exactly once");
+    }
+
     #[test]
     fn batched_click_is_observable_as_held() {
         let mut input = Input::new();

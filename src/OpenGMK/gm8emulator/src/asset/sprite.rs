@@ -61,9 +61,13 @@ pub fn process_image(image: &mut RgbaImage, removeback: bool, smooth: bool, fill
     }
     if removeback {
         // remove background colour
-        let bottom_left = image.get_pixel(0, image.height() - 1).to_rgb();
+        // Compare the whole pixel (including alpha), not just RGB: the game's `.gif` Pokémon have a
+        // *transparent black* background while their outline is *opaque black*, so matching on RGB
+        // alone wiped the black border. A plain colour-keyed sprite (opaque background) still works,
+        // since there the whole background shares the corner's alpha too.
+        let bottom_left = *image.get_pixel(0, image.height() - 1);
         for px in image.pixels_mut() {
-            if px.to_rgb() == bottom_left {
+            if *px == bottom_left {
                 px[3] = 0;
             }
         }
@@ -312,6 +316,23 @@ impl Sprite {
     }
 }
 
+impl Sprite {
+    /// The collision map used by the current animation frame. GM8 stores one map per frame for
+    /// sprites with `per_frame_colliders`; using the first map made opened doors/gates keep the
+    /// closed frame's collision.
+    pub fn collider_at(&self, image_index: Real) -> Option<&Collider> {
+        if self.colliders.is_empty() {
+            return None;
+        }
+        if self.per_frame_colliders && self.colliders.len() > 1 {
+            let frame = image_index.to_i32().max(0) as usize % self.colliders.len();
+            Some(&self.colliders[frame])
+        } else {
+            Some(&self.colliders[0])
+        }
+    }
+}
+
 impl Collider {
     // collision_point but it checks the collider's precise hitbox only, no AABB
     pub fn check_collision_point_precise(&self, x: i32, y: i32, inst_x: i32, inst_y: i32, origin_x: i32, origin_y: i32, xscale: Real, yscale: Real, angle_sin: f64, angle_cos: f64) -> bool {
@@ -320,10 +341,20 @@ impl Collider {
         util::rotate_around_center(x.as_mut_ref(), y.as_mut_ref(), angle_sin, angle_cos);
         let x = (Real::from(origin_x) + (x / xscale)).floor().to_i32();
         let y = (Real::from(origin_y) + (y / yscale)).floor().to_i32();
-        x >= self.bbox_left as i32
+        let within_bbox = x >= self.bbox_left as i32
             && y >= self.bbox_top as i32
             && x <= self.bbox_right as i32
-            && y <= self.bbox_bottom as i32
-            && self.data.get((y as usize * self.width as usize) + x as usize).copied().unwrap_or(false)
+            && y <= self.bbox_bottom as i32;
+        // A collision map with no set pixel means the sprite has no precise mask (GM8 then does
+        // a plain bounding-box collision). This is the case for the game's own `.gmspr` battle
+        // sprites, which store a bbox but no pixel mask: treating them as "never collides" is what
+        // made the "Vuelo" effect never land on the Pokémon. The map is not always literally empty:
+        // when the file carries the placeholder 1x1 mask it comes back as a single `false`, so the
+        // "missing mask" test has to look at the pixels, not just at the length.
+        if self.data.iter().all(|&px| !px) {
+            within_bbox
+        } else {
+            within_bbox && self.data.get((y as usize * self.width as usize) + x as usize).copied().unwrap_or(false)
+        }
     }
 }

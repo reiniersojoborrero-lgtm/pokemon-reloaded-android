@@ -11,7 +11,6 @@ import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearWavyProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -24,8 +23,10 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.withLink
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.klisee.reloaded.Blog
 import com.klisee.reloaded.GameRepository
 import com.klisee.reloaded.Preferences
@@ -48,6 +49,7 @@ fun Onboarding(
     var keepScreenOn by remember { mutableStateOf(prefs.keepScreenOn) }
     var busy by remember { mutableStateOf(false) }
     var progress by remember { mutableStateOf<Int?>(null) }
+    var installLog by remember { mutableStateOf(emptyList<String>()) }
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(Unit) { post = Blog.latest().getOrNull() }
@@ -56,8 +58,14 @@ fun Onboarding(
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
         busy = true
+        installLog = emptyList()
+        progress = null
         scope.launch {
-            repo.import(uri) { progress = it }
+            repo.import(
+                uri,
+                onProgress = { progress = it },
+                onLog = { line -> installLog = (installLog + line).takeLast(20) },
+            )
             busy = false
             progress = null
             status = repo.status()
@@ -80,13 +88,13 @@ fun Onboarding(
             title = "Pokemon Reloaded en Android",
             subtitle = buildAnnotatedString {
                 append(
-                    "Un port hecho por la comunidad y para la comunidad, por @kliseex. Corre sobre " +
+                    Strings.tr("Un port hecho por la comunidad y para la comunidad, por @kliseex. Corre sobre " +
                         "OpenGMK, una reimplementación nativa del motor de Game Maker 8, así que el " +
                         "juego se ejecuta de verdad: no hay ningún Windows emulado por medio y el " +
                         "rendimiento es prácticamente el de un juego nativo.\n\n" +
                         "Sigue en beta, y eso se nota: PUEDE TENER MUCHOS ERRORES Y FALLOS. Si tienes " +
                         "algún bug, mínimo o grave, por favor guarda un log y repórtalo.\n\n" +
-                        "Manda reportes de bugs, crasheos o congelamientos a ",
+                        "Manda reportes de bugs, crasheos o congelamientos a "),
                 )
                 withLink(LinkAnnotation.Url("https://github.com/Klisee/pokemon-reloaded-android")) {
                     append("GitHub")
@@ -105,17 +113,17 @@ fun Onboarding(
             title = "Antes de empezar",
             subtitle = buildAnnotatedString {
                 append(
-                    "Para poder jugar a este port en Android necesitas los archivos originales del " +
-                        "juego, que están en el blog de ",
+                    Strings.tr("Para poder jugar a este port en Android necesitas los archivos originales del " +
+                        "juego, que están en el blog de "),
                 )
                 withLink(LinkAnnotation.Url("https://pokemon-reloaded.blogspot.com/")) {
                     append("F3R")
                 }
                 append(
-                    ". Este APK no trae ningún asset del juego, y eso es lo que mantiene el proyecto " +
+                    Strings.tr(". Este APK no trae ningún asset del juego, y eso es lo que mantiene el proyecto " +
                         "del código abierto.\n\n" +
                         "Para empezar: dale a Descargar del blog, consigue el juego en un .zip y " +
-                        "después usa Importar un zip.",
+                        "después usa Importar un zip."),
                 )
             },
             continueLabel = "Continuar",
@@ -144,6 +152,13 @@ fun Onboarding(
             )
             if (busy) {
                 LinearWavyProgressIndicator(progress = { (progress ?: 0) / 100f }, modifier = Modifier.fillMaxWidth())
+                Text(
+                    text = installLog.takeLast(3).joinToString("\n").ifEmpty { "Comprobando el archivo…" },
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
 

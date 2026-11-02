@@ -3,6 +3,8 @@ use crate::{
     game::{Game, GetAsset, PlayType, Version},
     gml,
     math::Real,
+    render::BlendType,
+    types::Colour,
 };
 use serde::{Deserialize, Serialize};
 
@@ -116,66 +118,100 @@ impl Game {
     /// Draws all instances, tiles and backgrounds to the screen, taking all active views into account.
     /// Note that this function runs GML code associated with object draw events, so its usage must match GameMaker 8.
     pub fn draw(&mut self) -> gml::Result<()> {
+        self.renderer.set_interp_amount(if self.render_mode.interpolates() {
+            (1.0 - self.interp_alpha).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        });
+
         // Update views that should be following objects
         if self.room.views_enabled {
             self.renderer.clear_view(self.background_colour, 1.0);
-            for view in self.room.views.iter_mut().filter(|x| x.visible) {
-                if let Some(handle) = match view.follow_target {
-                    obj_id if obj_id < 100000 => {
-                        self.room.instance_list.iter_by_identity(view.follow_target).next(&self.room.instance_list)
-                    },
-                    inst_id => self.room.instance_list.get_by_instid(inst_id),
-                } {
-                    let inst = self.room.instance_list.get(handle);
+            if self.interp_update_views {
+                // This is the camera the step left behind, before following moves it again. Extra
+                // interpolation frames read it instead of updating the views themselves.
+                if self.render_mode.interpolates() {
+                    self.prev_views = Some(self.room.views.clone());
+                }
+                for view in self.room.views.iter_mut().filter(|x| x.visible) {
+                    if let Some(handle) = match view.follow_target {
+                        obj_id if obj_id < 100000 => {
+                            self.room.instance_list.iter_by_identity(view.follow_target).next(&self.room.instance_list)
+                        },
+                        inst_id => self.room.instance_list.get_by_instid(inst_id),
+                    } {
+                        let inst = self.room.instance_list.get(handle);
 
-                    let x = inst.x.get().round().to_i32();
-                    let y = inst.y.get().round().to_i32();
-                    if view.follow_hborder < view.source_w / 2 {
-                        let border_left = x - view.follow_hborder;
-                        let border_right = x + view.follow_hborder;
-                        if border_left < view.source_x {
-                            if view.follow_hspeed < 0 {
-                                view.source_x = border_left;
-                            } else {
-                                view.source_x -= (view.source_x - border_left).min(view.follow_hspeed);
+                        let x = inst.x.get().round().to_i32();
+                        let y = inst.y.get().round().to_i32();
+                        if view.follow_hborder < view.source_w / 2 {
+                            let border_left = x - view.follow_hborder;
+                            let border_right = x + view.follow_hborder;
+                            if border_left < view.source_x {
+                                if view.follow_hspeed < 0 {
+                                    view.source_x = border_left;
+                                } else {
+                                    view.source_x -= (view.source_x - border_left).min(view.follow_hspeed);
+                                }
+                            } else if border_right > view.source_x + view.source_w {
+                                if view.follow_hspeed < 0 {
+                                    view.source_x = border_right - view.source_w;
+                                } else {
+                                    view.source_x +=
+                                        (border_right - (view.source_x + view.source_w)).min(view.follow_hspeed);
+                                }
                             }
-                        } else if border_right > view.source_x + view.source_w {
-                            if view.follow_hspeed < 0 {
-                                view.source_x = border_right - view.source_w;
-                            } else {
-                                view.source_x +=
-                                    (border_right - (view.source_x + view.source_w)).min(view.follow_hspeed);
-                            }
+                        } else {
+                            view.source_x = x - view.source_w / 2;
                         }
-                    } else {
-                        view.source_x = x - view.source_w / 2;
-                    }
-                    view.source_x = view.source_x.max(0).min(self.room.width - view.source_w);
+                        view.source_x = view.source_x.max(0).min(self.room.width - view.source_w);
 
-                    if view.follow_vborder < view.source_h / 2 {
-                        let border_top = y - view.follow_vborder;
-                        let border_bottom = y + view.follow_vborder;
-                        if border_top < view.source_y {
-                            if view.follow_vspeed < 0 {
-                                view.source_y = border_top;
-                            } else {
-                                view.source_y -= (view.source_y - border_top).min(view.follow_vspeed);
+                        if view.follow_vborder < view.source_h / 2 {
+                            let border_top = y - view.follow_vborder;
+                            let border_bottom = y + view.follow_vborder;
+                            if border_top < view.source_y {
+                                if view.follow_vspeed < 0 {
+                                    view.source_y = border_top;
+                                } else {
+                                    view.source_y -= (view.source_y - border_top).min(view.follow_vspeed);
+                                }
+                            } else if border_bottom > view.source_y + view.source_h {
+                                if view.follow_vspeed < 0 {
+                                    view.source_y = border_bottom - view.source_h;
+                                } else {
+                                    view.source_y +=
+                                        (border_bottom - (view.source_y + view.source_h)).min(view.follow_vspeed);
+                                }
                             }
-                        } else if border_bottom > view.source_y + view.source_h {
-                            if view.follow_vspeed < 0 {
-                                view.source_y = border_bottom - view.source_h;
-                            } else {
-                                view.source_y +=
-                                    (border_bottom - (view.source_y + view.source_h)).min(view.follow_vspeed);
-                            }
+                        } else {
+                            view.source_y = y - view.source_h / 2;
                         }
-                    } else {
-                        view.source_y = y - view.source_h / 2;
+                        view.source_y = view.source_y.max(0).min(self.room.height - view.source_h);
                     }
-                    view.source_y = view.source_y.max(0).min(self.room.height - view.source_h);
                 }
             }
         }
+
+        // The camera is shown between where it was on the previous step and where it is now. The
+        // room keeps its real view; only the drawing below sees the interpolated one.
+        let saved_views = if self.room.views_enabled && self.render_mode.interpolates() && self.interp_alpha < 1.0 {
+            self.prev_views.as_ref().map(|previous| {
+                let alpha = self.interp_alpha;
+                let mut views = self.room.views.clone();
+                for (view, old) in views.iter_mut().zip(previous.iter()) {
+                    view.source_x = (f64::from(old.source_x) + f64::from(view.source_x - old.source_x) * alpha).round() as i32;
+                    view.source_y = (f64::from(old.source_y) + f64::from(view.source_y - old.source_y) * alpha).round() as i32;
+                }
+                std::mem::replace(&mut self.room.views, views)
+            })
+        } else {
+            None
+        };
+
+        // The character picker's arrows are placed from what the game draws, so the frame's box starts
+        // empty here and the sprite draws below fill it.
+        #[cfg(target_os = "android")]
+        crate::touch_controls::reset_character_sprites();
 
         // Draw all views
         if self.room.views_enabled {
@@ -203,6 +239,10 @@ impl Game {
             self.draw_view(0, 0, self.room.width, self.room.height, 0, 0, self.room.width, self.room.height, 0.0)?;
         }
 
+        if let Some(saved) = saved_views {
+            self.room.views = saved;
+        }
+
         // Reset viewport
         self.renderer.set_view(
             0,
@@ -216,19 +256,578 @@ impl Game {
             self.unscaled_height as _,
         );
 
-        // Apply room caption
-        let title = self.get_window_title();
-        if self.play_type != PlayType::Record {
-            self.window.set_title(title.as_ref());
+        if self.show_fps {
+            self.draw_fps_overlay();
+        }
+        if self.room.id == 30 && self.mods_available() && !self.mods_menu_open {
+            self.draw_mods_button();
+        }
+        if self.mods_menu_open {
+            self.draw_mods_menu();
+        }
+        if self.online_menu_open {
+            self.draw_online_menu();
+        }
+        if self.interaction_menu_open {
+            self.draw_interaction_menu();
+        }
+        if self.interaction_request.is_some() {
+            self.draw_interaction_request();
+        }
+        if self.interaction_response.is_some() {
+            self.draw_interaction_response();
+        }
+
+        // Apply room caption. The extra interpolation frames are not new game frames, so they must
+        // not keep poking the window manager.
+        if !self.interp_draw {
+            let title = self.get_window_title();
+            if self.play_type != PlayType::Record {
+                self.window.set_title(title.as_ref());
+            }
         }
 
         Ok(())
     }
 
+    fn draw_interaction_panel(
+        &mut self,
+        title: &str,
+        body: &str,
+        options: &[&str],
+        selected: Option<usize>,
+        option_start: usize,
+    ) {
+        let (x1, y1, x2, y2) = self.online_menu_panel();
+        let old_font = self.draw_font_id;
+        let old_colour = self.draw_colour;
+        let old_alpha = self.draw_alpha;
+        let old_halign = self.draw_halign;
+        let old_valign = self.draw_valign;
+        let old_depth = self.renderer.get_depth();
+        let old_depth_test = self.renderer.get_depth_test();
+        let old_write_depth = self.renderer.get_write_depth();
+        let old_alpha_blending = self.renderer.get_alpha_blending();
+        let old_blend_mode = self.renderer.get_blend_mode();
+        self.draw_font_id = if self.assets.fonts.get_asset(17).is_some() {
+            17
+        } else if self.assets.fonts.get_asset(0).is_some() {
+            0
+        } else {
+            -1
+        };
+        self.draw_halign = Halign::Middle;
+        self.draw_valign = Valign::Top;
+        self.draw_alpha = Real::from(1.0);
+        self.renderer.set_draw_offset(0.0, 0.0);
+        self.renderer.set_depth(-32000.0);
+        self.renderer.set_depth_test(false);
+        self.renderer.set_write_depth(false);
+        self.renderer.set_alpha_blending(true);
+        self.renderer.set_blend_mode(BlendType::SrcAlpha, BlendType::InvSrcAlpha);
+        self.renderer.draw_roundrect(x1 as f64, y1 as f64, x2 as f64, y2 as f64, 0, 0, 0.9, false);
+        self.renderer.draw_roundrect(x1 as f64, y1 as f64, x2 as f64, y2 as f64, 0xffffff, 0xffffff, 0.45, true);
+        let center = f64::from(x1 + x2) * 0.5;
+        self.draw_colour = Colour::new(1.0, 1.0, 1.0);
+        self.draw_string(
+            Real::from(center),
+            Real::from(f64::from(y1) + 5.0),
+            gml::String::from(title),
+            None,
+            None,
+            Real::from(1.0),
+            Real::from(1.0),
+            Real::from(0.0),
+            None,
+            Real::from(1.0),
+        );
+        if !body.is_empty() {
+            self.draw_string(
+                Real::from(center),
+                Real::from(f64::from(y1) + 24.0),
+                gml::String::from(body),
+                None,
+                None,
+                Real::from(1.0),
+                Real::from(1.0),
+                Real::from(0.0),
+                None,
+                Real::from(1.0),
+            );
+        }
+        for (index, label) in options.iter().enumerate() {
+            let (rx1, ry1, rx2, ry2) = self.interaction_row(option_start + index);
+            if selected == Some(index) {
+                self.renderer.draw_roundrect(
+                    rx1 as f64,
+                    ry1 as f64,
+                    rx2 as f64,
+                    ry2 as f64,
+                    0xffffff,
+                    0xffffff,
+                    0.16,
+                    false,
+                );
+            }
+            self.draw_colour = if selected == Some(index) {
+                Colour::from(0x00ffffu32)
+            } else {
+                Colour::new(1.0, 1.0, 1.0)
+            };
+            self.draw_string(
+                Real::from(f64::from(rx1 + rx2) * 0.5),
+                Real::from(f64::from(ry1) + 2.0),
+                gml::String::from(*label),
+                None,
+                None,
+                Real::from(1.0),
+                Real::from(1.0),
+                Real::from(0.0),
+                None,
+                Real::from(1.0),
+            );
+        }
+        if options.is_empty() {
+            self.draw_colour = Colour::new(0.7, 0.7, 0.7);
+            self.draw_string(
+                Real::from(center),
+                Real::from(f64::from(y2) - 16.0),
+                gml::String::from("Z / Enter para cerrar"),
+                None,
+                None,
+                Real::from(1.0),
+                Real::from(1.0),
+                Real::from(0.0),
+                None,
+                Real::from(1.0),
+            );
+        }
+        self.renderer.set_depth(old_depth);
+        self.renderer.set_depth_test(old_depth_test);
+        self.renderer.set_write_depth(old_write_depth);
+        self.renderer.set_alpha_blending(old_alpha_blending);
+        self.renderer.set_blend_mode(old_blend_mode.0, old_blend_mode.1);
+        self.draw_font_id = old_font;
+        self.draw_colour = old_colour;
+        self.draw_alpha = old_alpha;
+        self.draw_halign = old_halign;
+        self.draw_valign = old_valign;
+    }
+
+    fn draw_interaction_menu(&mut self) {
+        let title = format!("Jugador: {}", self.interaction_target_name);
+        self.draw_interaction_panel(&title, "", &["Combatir", "Intercambiar", "Regalar", "Cancelar"], Some(self.interaction_menu_selection), 0);
+    }
+
+    fn draw_interaction_request(&mut self) {
+        let Some((_, name, kind, _)) = self.interaction_request.as_ref() else { return };
+        let action = match kind.as_str() {
+            "F" => "combatir",
+            "T" => "intercambiar Pokemon",
+            _ => "regalarte un Pokemon",
+        };
+        let body = format!("{name} quiere {action}.#Aceptas?");
+        let title = "Solicitud online";
+        self.draw_interaction_panel(&title, &body, &["Si", "No"], Some(self.interaction_menu_selection), 2);
+    }
+
+    fn draw_interaction_response(&mut self) {
+        let Some((message, _)) = self.interaction_response.as_ref() else { return };
+        let message = message.clone();
+        self.draw_interaction_panel("Reloaded Online", &message, &[], None, 0);
+    }
+
+    fn draw_mods_button(&mut self) {
+        let (x1, y1, x2, y2) = self.mods_button_rect();
+        let old_font = self.draw_font_id;
+        let old_colour = self.draw_colour;
+        let old_alpha = self.draw_alpha;
+        let old_halign = self.draw_halign;
+        let old_valign = self.draw_valign;
+        let old_depth = self.renderer.get_depth();
+        let old_depth_test = self.renderer.get_depth_test();
+        let old_write_depth = self.renderer.get_write_depth();
+        let old_alpha_blending = self.renderer.get_alpha_blending();
+        let old_blend_mode = self.renderer.get_blend_mode();
+        self.draw_font_id = if self.assets.fonts.get_asset(0).is_some() { 0 } else { -1 };
+        self.draw_halign = Halign::Middle;
+        self.draw_valign = Valign::Top;
+        self.draw_alpha = Real::from(1.0);
+        self.renderer.set_draw_offset(0.0, 0.0);
+        self.renderer.set_depth(-32000.0);
+        self.renderer.set_depth_test(false);
+        self.renderer.set_write_depth(false);
+        self.renderer.set_alpha_blending(true);
+        self.renderer.set_blend_mode(BlendType::SrcAlpha, BlendType::InvSrcAlpha);
+        self.renderer.draw_roundrect(x1 as f64, y1 as f64, x2 as f64, y2 as f64, 0, 0, 0.65, false);
+        self.renderer.draw_roundrect(x1 as f64, y1 as f64, x2 as f64, y2 as f64, 0xffffff, 0xffffff, 0.5, true);
+        self.draw_colour = Colour::new(1.0, 1.0, 1.0);
+        self.draw_string(
+            Real::from(f64::from(x1 + x2) * 0.5),
+            Real::from(f64::from(y1) + 4.0),
+            gml::String::from("Mods"),
+            None,
+            None,
+            Real::from(1.0),
+            Real::from(1.0),
+            Real::from(0.0),
+            None,
+            Real::from(1.0),
+        );
+        self.renderer.set_depth(old_depth);
+        self.renderer.set_depth_test(old_depth_test);
+        self.renderer.set_write_depth(old_write_depth);
+        self.renderer.set_alpha_blending(old_alpha_blending);
+        self.renderer.set_blend_mode(old_blend_mode.0, old_blend_mode.1);
+        self.draw_font_id = old_font;
+        self.draw_colour = old_colour;
+        self.draw_alpha = old_alpha;
+        self.draw_halign = old_halign;
+        self.draw_valign = old_valign;
+    }
+
+    fn draw_mods_menu(&mut self) {
+        let (x1, y1, x2, y2) = self.mods_menu_panel();
+        let (mouse_x, mouse_y) = (self.input.mouse_x(), self.input.mouse_y());
+        let old_font = self.draw_font_id;
+        let old_colour = self.draw_colour;
+        let old_alpha = self.draw_alpha;
+        let old_halign = self.draw_halign;
+        let old_valign = self.draw_valign;
+        let old_depth = self.renderer.get_depth();
+        let old_depth_test = self.renderer.get_depth_test();
+        let old_write_depth = self.renderer.get_write_depth();
+        let old_alpha_blending = self.renderer.get_alpha_blending();
+        let old_blend_mode = self.renderer.get_blend_mode();
+        self.draw_font_id = if self.assets.fonts.get_asset(17).is_some() {
+            17
+        } else if self.assets.fonts.get_asset(0).is_some() {
+            0
+        } else {
+            -1
+        };
+        self.draw_halign = Halign::Middle;
+        self.draw_valign = Valign::Top;
+        self.draw_alpha = Real::from(1.0);
+        self.renderer.set_draw_offset(0.0, 0.0);
+        self.renderer.set_depth(-32000.0);
+        self.renderer.set_depth_test(false);
+        self.renderer.set_write_depth(false);
+        self.renderer.set_alpha_blending(true);
+        self.renderer.set_blend_mode(BlendType::SrcAlpha, BlendType::InvSrcAlpha);
+        self.renderer.draw_roundrect(x1 as f64, y1 as f64, x2 as f64, y2 as f64, 0, 0, 0.94, false);
+        self.renderer.draw_roundrect(x1 as f64, y1 as f64, x2 as f64, y2 as f64, 0xffffff, 0xffffff, 0.45, true);
+        let center = f64::from(x1 + x2) * 0.5;
+        self.draw_colour = Colour::new(1.0, 1.0, 1.0);
+        self.draw_string(
+            Real::from(center),
+            Real::from(f64::from(y1) + 5.0),
+            gml::String::from("Mods"),
+            None,
+            None,
+            Real::from(1.0),
+            Real::from(1.0),
+            Real::from(0.0),
+            None,
+            Real::from(1.0),
+        );
+        let lines = self.mods_menu_lines();
+        for (index, line) in lines.iter().take(7).enumerate() {
+            let (rx1, ry1, rx2, ry2) = self.mods_menu_row(index);
+            let hovered = mouse_x >= rx1 && mouse_x <= rx2 && mouse_y >= ry1 && mouse_y <= ry2;
+            if hovered {
+                self.renderer.draw_roundrect(
+                    rx1 as f64,
+                    ry1 as f64,
+                    rx2 as f64,
+                    ry2 as f64,
+                    0xffffff,
+                    0xffffff,
+                    0.16,
+                    false,
+                );
+            }
+            self.draw_colour = if line.contains("[ON]") {
+                Colour::from(0x7fffd4u32)
+            } else {
+                Colour::new(0.75, 0.75, 0.75)
+            };
+            self.draw_string(
+                Real::from(center),
+                Real::from(f64::from(ry1) + 2.0),
+                gml::String::from(line.as_str()),
+                None,
+                None,
+                Real::from(1.0),
+                Real::from(1.0),
+                Real::from(0.0),
+                None,
+                Real::from(1.0),
+            );
+        }
+        if lines.is_empty() {
+            self.draw_colour = Colour::new(0.75, 0.75, 0.75);
+            self.draw_string(
+                Real::from(center),
+                Real::from(f64::from(y1) + 40.0),
+                gml::String::from("Sin mods activos"),
+                None,
+                None,
+                Real::from(1.0),
+                Real::from(1.0),
+                Real::from(0.0),
+                None,
+                Real::from(1.0),
+            );
+        }
+        let (cx1, cy1, cx2, cy2) = self.mods_menu_close_rect();
+        let close_hovered = mouse_x >= cx1 && mouse_x <= cx2 && mouse_y >= cy1 && mouse_y <= cy2;
+        if close_hovered {
+            self.renderer.draw_roundrect(
+                cx1 as f64,
+                cy1 as f64,
+                cx2 as f64,
+                cy2 as f64,
+                0xffffff,
+                0xffffff,
+                0.16,
+                false,
+            );
+        }
+        self.draw_colour = if close_hovered {
+            Colour::from(0x00ffffu32)
+        } else {
+            Colour::new(1.0, 1.0, 1.0)
+        };
+        self.draw_string(
+            Real::from(center),
+            Real::from(f64::from(cy1) + 2.0),
+            gml::String::from("Volver"),
+            None,
+            None,
+            Real::from(1.0),
+            Real::from(1.0),
+            Real::from(0.0),
+            None,
+            Real::from(1.0),
+        );
+        self.renderer.set_depth(old_depth);
+        self.renderer.set_depth_test(old_depth_test);
+        self.renderer.set_write_depth(old_write_depth);
+        self.renderer.set_alpha_blending(old_alpha_blending);
+        self.renderer.set_blend_mode(old_blend_mode.0, old_blend_mode.1);
+        self.draw_font_id = old_font;
+        self.draw_colour = old_colour;
+        self.draw_alpha = old_alpha;
+        self.draw_halign = old_halign;
+        self.draw_valign = old_valign;
+    }
+
+    fn draw_online_menu(&mut self) {
+        let (x1, y1, x2, y2) = self.online_menu_panel();
+        let old_font = self.draw_font_id;
+        let old_colour = self.draw_colour;
+        let old_alpha = self.draw_alpha;
+        let old_halign = self.draw_halign;
+        let old_valign = self.draw_valign;
+        let old_depth = self.renderer.get_depth();
+        let old_depth_test = self.renderer.get_depth_test();
+        let old_write_depth = self.renderer.get_write_depth();
+        let old_alpha_blending = self.renderer.get_alpha_blending();
+        let old_blend_mode = self.renderer.get_blend_mode();
+        self.draw_font_id = if self.assets.fonts.get_asset(17).is_some() {
+            17
+        } else if self.assets.fonts.get_asset(0).is_some() {
+            0
+        } else {
+            -1
+        };
+        self.draw_halign = Halign::Middle;
+        self.draw_valign = Valign::Top;
+        self.draw_alpha = Real::from(1.0);
+        self.renderer.set_draw_offset(0.0, 0.0);
+        self.renderer.set_depth(-32000.0);
+        self.renderer.set_depth_test(false);
+        self.renderer.set_write_depth(false);
+        self.renderer.set_alpha_blending(true);
+        self.renderer.set_blend_mode(BlendType::SrcAlpha, BlendType::InvSrcAlpha);
+        self.renderer.draw_roundrect(x1 as f64, y1 as f64, x2 as f64, y2 as f64, 0, 0, 0.88, false);
+        self.renderer.draw_roundrect(x1 as f64, y1 as f64, x2 as f64, y2 as f64, 0xffffff, 0xffffff, 0.45, true);
+
+        let center = f64::from(x1 + x2) * 0.5;
+        self.draw_colour = Colour::new(1.0, 1.0, 1.0);
+        self.draw_string(
+            Real::from(center),
+            Real::from(f64::from(y1) + 5.0),
+            gml::String::from("A que modo quieres jugar?"),
+            None,
+            None,
+            Real::from(1.0),
+            Real::from(1.0),
+            Real::from(0.0),
+            None,
+            Real::from(1.0),
+        );
+
+        let options = ["Local", "Mundo online (servidor local)", "Cancelar"];
+        for (index, label) in options.iter().enumerate() {
+            let (rx1, ry1, rx2, ry2) = self.online_menu_row(index);
+            let selected = index == self.online_menu_selection;
+            if selected {
+                self.renderer.draw_roundrect(
+                    rx1 as f64,
+                    ry1 as f64,
+                    rx2 as f64,
+                    ry2 as f64,
+                    0xffffff,
+                    0xffffff,
+                    0.16,
+                    false,
+                );
+            }
+            self.draw_colour = if selected { Colour::from(0x00ffffu32) } else { Colour::new(1.0, 1.0, 1.0) };
+            self.draw_string(
+                Real::from(f64::from(rx1 + rx2) * 0.5),
+                Real::from(f64::from(ry1) + 2.0),
+                gml::String::from(*label),
+                None,
+                None,
+                Real::from(1.0),
+                Real::from(1.0),
+                Real::from(0.0),
+                None,
+                Real::from(1.0),
+            );
+        }
+
+        self.draw_colour = Colour::new(0.7, 0.7, 0.7);
+        self.draw_string(
+            Real::from(center),
+            Real::from(f64::from(y2) - 16.0),
+            gml::String::from(self.reloaded_online.status()),
+            None,
+            None,
+            Real::from(1.0),
+            Real::from(1.0),
+            Real::from(0.0),
+            None,
+            Real::from(1.0),
+        );
+
+        self.renderer.set_depth(old_depth);
+        self.renderer.set_depth_test(old_depth_test);
+        self.renderer.set_write_depth(old_write_depth);
+        self.renderer.set_alpha_blending(old_alpha_blending);
+        self.renderer.set_blend_mode(old_blend_mode.0, old_blend_mode.1);
+        self.draw_font_id = old_font;
+        self.draw_colour = old_colour;
+        self.draw_alpha = old_alpha;
+        self.draw_halign = old_halign;
+        self.draw_valign = old_valign;
+    }
+
+    /// Draws the optional "FPS: N" label in the game's own font, at the top centre of the game
+    /// framebuffer. Uses the dialogue font when the game has one so it matches the rest of the UI.
+    fn draw_fps_overlay(&mut self) {
+        let font_id = if self.assets.fonts.get_asset(2).is_some() {
+            2
+        } else if self.assets.fonts.get_asset(self.draw_font_id).is_some() {
+            self.draw_font_id
+        } else {
+            -1
+        };
+
+        let old_font = self.draw_font_id;
+        let old_colour = self.draw_colour;
+        let old_alpha = self.draw_alpha;
+        let old_halign = self.draw_halign;
+        let old_valign = self.draw_valign;
+        let old_depth = self.renderer.get_depth();
+        let old_depth_test = self.renderer.get_depth_test();
+        let old_write_depth = self.renderer.get_write_depth();
+        let old_alpha_blending = self.renderer.get_alpha_blending();
+        let old_blend_mode = self.renderer.get_blend_mode();
+
+        self.draw_font_id = font_id;
+        self.draw_halign = Halign::Middle;
+        self.draw_valign = Valign::Top;
+        self.draw_alpha = Real::from(1.0);
+        self.renderer.set_draw_offset(0.0, 0.0);
+        self.renderer.set_depth(-32000.0);
+        self.renderer.set_depth_test(false);
+        self.renderer.set_write_depth(false);
+        self.renderer.set_alpha_blending(true);
+        self.renderer.set_blend_mode(BlendType::SrcAlpha, BlendType::InvSrcAlpha);
+
+        let text = gml::String::from(format!("FPS: {}", self.render_fps));
+        let (text_w, text_h) = self.get_string_size(text.clone(), None, None);
+        let center = self.unscaled_width as f64 / 2.0;
+        let pad_x = 3.0;
+        let pad_y = 2.0;
+        let x1 = center - f64::from(text_w) / 2.0 - pad_x;
+        let x2 = center + f64::from(text_w) / 2.0 + pad_x;
+        let y1 = 1.0;
+        let y2 = 2.0 + f64::from(text_h) + pad_y;
+        // Same idea as the game's clock: a translucent black plate behind the text.
+        self.renderer.draw_roundrect(x1, y1, x2, y2, 0, 0, 0.65, false);
+
+        let x = Real::from(self.unscaled_width as i32 / 2);
+        let y = Real::from(2);
+        self.draw_colour = Colour::new(0.0, 0.0, 0.0);
+        self.draw_string(
+            x + Real::from(1.0),
+            y + Real::from(1.0),
+            text.clone(),
+            None,
+            None,
+            Real::from(1.0),
+            Real::from(1.0),
+            Real::from(0.0),
+            None,
+            Real::from(1.0),
+        );
+        self.draw_colour = Colour::new(1.0, 1.0, 1.0);
+        self.draw_string(
+            x,
+            y,
+            text,
+            None,
+            None,
+            Real::from(1.0),
+            Real::from(1.0),
+            Real::from(0.0),
+            None,
+            Real::from(1.0),
+        );
+
+        self.renderer.set_depth(old_depth);
+        self.renderer.set_depth_test(old_depth_test);
+        self.renderer.set_write_depth(old_write_depth);
+        self.renderer.set_alpha_blending(old_alpha_blending);
+        self.renderer.set_blend_mode(old_blend_mode.0, old_blend_mode.1);
+        self.draw_font_id = old_font;
+        self.draw_colour = old_colour;
+        self.draw_alpha = old_alpha;
+        self.draw_halign = old_halign;
+        self.draw_valign = old_valign;
+    }
+
     pub fn draw_instance_default(&mut self, idx: usize) -> gml::Result<()> {
         let instance = self.room.instance_list.get(idx);
-        if let Some(sprite) = self.assets.sprites.get_asset(instance.sprite_index.get()) {
+        let sprite_index = instance.sprite_index.get();
+        if sprite_index < 0 {
+            eprintln!(
+                "[sprite] instancia {} objeto {} sin sprite en sala {}",
+                instance.id.get(),
+                instance.object_index.get(),
+                self.room.id
+            );
+            return Ok(())
+        }
+        if let Some(sprite) = self.assets.sprites.get_asset(sprite_index) {
             if let Some(atlas_ref) = sprite.get_atlas_ref(instance.image_index.get().floor().to_i32()) {
+                // The caller (draw_instance / draw_self) already set the interpolation offset for
+                // this instance; don't reset it here or the rest of a custom draw event would lose it.
                 self.renderer.draw_sprite(
                     atlas_ref,
                     instance.x.get().into(),
@@ -242,7 +841,14 @@ impl Game {
             }
             Ok(())
         } else {
-            Err(gml::Error::NonexistentAsset(asset::Type::Sprite, instance.sprite_index.get()))
+            eprintln!(
+                "[sprite] instancia {} objeto {} sprite inexistente {} en sala {}",
+                instance.id.get(),
+                instance.object_index.get(),
+                sprite_index,
+                self.room.id
+            );
+            Ok(())
         }
     }
 
@@ -270,15 +876,20 @@ impl Game {
         fn draw_instance(game: &mut Game, idx: usize) -> gml::Result<()> {
             let instance = game.room.instance_list.get(idx);
             if instance.visible.get() {
+                let dx: f64 = (instance.xprevious.get() - instance.x.get()).into();
+                let dy: f64 = (instance.yprevious.get() - instance.y.get()).into();
                 game.renderer.set_depth(instance.depth.get().into_inner() as f32);
-                if game.custom_draw_objects.contains(&instance.object_index.get()) {
+                game.renderer.set_draw_offset(dx, dy);
+                let result = if game.custom_draw_objects.contains(&instance.object_index.get()) {
                     // Custom draw event
                     game.run_instance_event(gml::ev::DRAW, 0, idx, idx, None)
                 } else {
                     // Default draw action
                     let _ = game.draw_instance_default(idx);
                     Ok(())
-                }
+                };
+                game.renderer.set_draw_offset(0.0, 0.0);
+                result
             } else {
                 Ok(())
             }
@@ -287,6 +898,7 @@ impl Game {
         fn draw_tile(game: &mut Game, idx: usize) {
             let tile = game.room.tile_list.get(idx);
             if tile.visible.get() {
+                game.renderer.set_draw_offset(0.0, 0.0);
                 if let Some(Some(background)) = game.assets.backgrounds.get(tile.background_index.get() as usize) {
                     if let Some(atlas) = background.atlas_ref {
                         game.renderer.set_depth(tile.depth.get().into_inner() as f32);
@@ -310,6 +922,7 @@ impl Game {
         }
 
         fn draw_part_syst(game: &mut Game, id: i32) {
+            game.renderer.set_draw_offset(0.0, 0.0);
             game.particles.draw_system(id, &mut game.renderer, &game.assets, true);
         }
 
@@ -319,6 +932,7 @@ impl Game {
     
         // draw backgrounds
         self.renderer.set_depth(12000.0);
+        self.renderer.set_draw_offset(0.0, 0.0);
         for background in self.room.backgrounds.iter().filter(|x| x.visible && !x.is_foreground) {
             if let Some(bg_asset) = self.assets.backgrounds.get_asset(background.background_id) {
                 if let Some(atlas_ref) = bg_asset.atlas_ref {
@@ -346,26 +960,39 @@ impl Game {
         self.particles.draw_sort();
         let mut iter_part = self.particles.iter_by_drawing();
         let mut iter_part_v = iter_part.next(&self.particles);
+        self.reloaded_online.begin_draw();
         loop {
             match (iter_inst_v, iter_tile_v, iter_part_v) {
                 (None, None, None) => break,
                 (Some(idx_inst), None, None) => {
+                    let depth = self.room.instance_list.get(idx_inst).depth.get().into_inner();
+                    self.reloaded_online.draw_before_depth(&mut self.renderer, &self.assets, self.room.id, depth);
                     draw_instance(self, idx_inst)?;
                     while let Some(idx_inst) = iter_inst.next(&self.room.instance_list) {
+                        let depth = self.room.instance_list.get(idx_inst).depth.get().into_inner();
+                        self.reloaded_online.draw_before_depth(&mut self.renderer, &self.assets, self.room.id, depth);
                         draw_instance(self, idx_inst)?;
                     }
                     break
                 },
                 (None, Some(idx_tile), None) => {
+                    let depth = self.room.tile_list.get(idx_tile).depth.get().into_inner();
+                    self.reloaded_online.draw_before_depth(&mut self.renderer, &self.assets, self.room.id, depth);
                     draw_tile(self, idx_tile);
                     while let Some(idx_tile) = iter_tile.next(&self.room.tile_list) {
+                        let depth = self.room.tile_list.get(idx_tile).depth.get().into_inner();
+                        self.reloaded_online.draw_before_depth(&mut self.renderer, &self.assets, self.room.id, depth);
                         draw_tile(self, idx_tile);
                     }
                     break
                 },
                 (None, None, Some(idx_part)) => {
+                    let depth = self.particles.get_system(idx_part).unwrap().depth.into_inner();
+                    self.reloaded_online.draw_before_depth(&mut self.renderer, &self.assets, self.room.id, depth);
                     draw_part_syst(self, idx_part);
                     while let Some(idx_part) = iter_part.next(&self.particles) {
+                        let depth = self.particles.get_system(idx_part).unwrap().depth.into_inner();
+                        self.reloaded_online.draw_before_depth(&mut self.renderer, &self.assets, self.room.id, depth);
                         draw_part_syst(self, idx_part);
                     }
                     break
@@ -376,13 +1003,19 @@ impl Game {
                     let part_depth = idx_opt_part.map(|h| self.particles.get_system(h).unwrap().depth);
                     if part_depth < inst_depth && part_depth < tile_depth {
                         if inst_depth < tile_depth {
+                            let depth = tile_depth.unwrap().into_inner();
+                            self.reloaded_online.draw_before_depth(&mut self.renderer, &self.assets, self.room.id, depth);
                             draw_tile(self, idx_opt_tile.unwrap());
                             iter_tile_v = iter_tile.next(&self.room.tile_list);
                         } else {
+                            let depth = inst_depth.unwrap().into_inner();
+                            self.reloaded_online.draw_before_depth(&mut self.renderer, &self.assets, self.room.id, depth);
                             draw_instance(self, idx_opt_inst.unwrap())?;
                             iter_inst_v = iter_inst.next(&self.room.instance_list);
                         }
                     } else {
+                        let depth = part_depth.unwrap().into_inner();
+                        self.reloaded_online.draw_before_depth(&mut self.renderer, &self.assets, self.room.id, depth);
                         draw_part_syst(self, idx_opt_part.unwrap());
                         iter_part_v = iter_part.next(&self.particles);
                     }
@@ -391,6 +1024,7 @@ impl Game {
         }
 
         // draw foregrounds
+        self.renderer.set_draw_offset(0.0, 0.0);
         self.renderer.set_depth(-12000.0);
         for background in self.room.backgrounds.clone().iter().filter(|x| x.visible && x.is_foreground) {
             if let Some(bg_asset) = self.assets.backgrounds.get_asset(background.background_id) {
@@ -420,7 +1054,111 @@ impl Game {
             }
         }
 
+        self.reloaded_online.draw_remaining(&mut self.renderer, &self.assets, self.room.id);
+        self.draw_online_labels();
+
         Ok(())
+    }
+
+    fn draw_online_labels(&mut self) {
+        if !self.reloaded_online.is_active() {
+            return
+        }
+        let local_name = self.reloaded_online.local_name().to_string();
+        let remote_labels = self.reloaded_online.remote_labels(self.room.id, &self.assets);
+        if remote_labels.is_empty() {
+            return
+        }
+        let local_label = self
+            .assets
+            .objects
+            .iter()
+            .enumerate()
+            .find(|(_, object)| {
+                object
+                    .as_ref()
+                    .map(|object| object.name.as_ref() == b"obj_Prota")
+                    .unwrap_or(false)
+            })
+            .and_then(|(index, _)| {
+                self.room
+                    .instance_list
+                    .iter_by_identity(index as crate::types::ID)
+                    .next(&self.room.instance_list)
+            })
+            .and_then(|handle| {
+                let instance = self.room.instance_list.get(handle);
+                if !instance.visible.get() {
+                    return None
+                }
+                let sprite = self.assets.sprites.get_asset(instance.sprite_index.get())?;
+                let top = instance.y.get().into_inner()
+                    - f64::from(sprite.origin_y) * instance.image_yscale.get().into_inner();
+                Some((instance.x.get().into_inner(), top))
+            });
+        if local_name.is_empty() && remote_labels.is_empty() {
+            return
+        }
+        let old_font = self.draw_font_id;
+        let old_colour = self.draw_colour;
+        let old_alpha = self.draw_alpha;
+        let old_halign = self.draw_halign;
+        let old_valign = self.draw_valign;
+        self.draw_font_id = if self.assets.fonts.get_asset(17).is_some() {
+            17
+        } else if self.assets.fonts.get_asset(0).is_some() {
+            0
+        } else {
+            -1
+        };
+        self.draw_colour = Colour::new(0.0, 0.0, 0.0);
+        self.draw_alpha = Real::from(1.0);
+        self.draw_halign = Halign::Middle;
+        self.draw_valign = Valign::Bottom;
+        self.renderer.set_depth(-13001.0);
+        if !local_name.is_empty() {
+            if let Some((x, top)) = local_label {
+                self.draw_online_label(x, top - 2.0, &local_name, 0x00ffff);
+            }
+        }
+        for (name, x, top) in remote_labels {
+            self.draw_online_label(x, top - 2.0, &name, 0xffffff);
+        }
+        self.draw_font_id = old_font;
+        self.draw_colour = old_colour;
+        self.draw_alpha = old_alpha;
+        self.draw_halign = old_halign;
+        self.draw_valign = old_valign;
+    }
+
+    fn draw_online_label(&mut self, x: f64, y: f64, name: &str, colour: u32) {
+        let text: gml::String = name.into();
+        self.draw_colour = Colour::new(0.0, 0.0, 0.0);
+        self.draw_string(
+            Real::from(x + 1.0),
+            Real::from(y + 1.0),
+            text.clone(),
+            None,
+            None,
+            Real::from(1.0),
+            Real::from(1.0),
+            Real::from(0.0),
+            None,
+            Real::from(1.0),
+        );
+        self.draw_colour = Colour::from(colour);
+        self.draw_string(
+            Real::from(x),
+            Real::from(y),
+            text,
+            None,
+            None,
+            Real::from(1.0),
+            Real::from(1.0),
+            Real::from(0.0),
+            None,
+            Real::from(1.0),
+        );
     }
 
     /// Splits the string into line-width pairs.

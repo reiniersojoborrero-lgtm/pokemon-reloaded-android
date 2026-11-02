@@ -15,6 +15,8 @@ mod input;
 mod instance;
 mod instancelist;
 mod math;
+mod mods;
+mod reloaded_online;
 mod render;
 mod tile;
 mod types;
@@ -23,12 +25,15 @@ mod util;
 #[cfg(target_os = "android")]
 mod android_main;
 
-#[cfg(target_os = "android")]
-mod touch_controls;
+/// The on-screen touch controls and their customisable layout. Built on every target so the
+/// `dump_layout` example can turn the built-in layout into the file the launcher app draws.
+pub mod touch_controls;
+pub mod touch_appearance;
+pub mod touch_skin;
+pub mod field_controls;
+pub mod touch_navigation;
 
 mod main_impl;
-
-mod patches;
 
 mod scan;
 

@@ -5,6 +5,7 @@ pub mod events;
 pub mod external;
 pub mod gm_save;
 pub mod includedfile;
+pub mod info_window;
 pub mod model;
 pub mod movement;
 pub mod particle;
@@ -38,10 +39,10 @@ use crate::{
     gml::{self, ds, ev, file, rand::Random, runtime::Instruction, Compiler, Context},
     handleman::{HandleArray, HandleList, HandleManager},
     input::{self, Input},
-    instance::{DummyFieldHolder, Instance, InstanceState},
+    instance::{DummyFieldHolder, Field, Instance, InstanceState},
     instancelist::{InstanceList, TileList},
     math::Real,
-    render::{atlas::AtlasBuilder, Renderer, RendererOptions, Scaling},
+    render::{atlas::AtlasBuilder, RenderMode, Renderer, RendererOptions, Scaling},
     tile,
     types::{Colour, ID},
     util,
@@ -175,14 +176,42 @@ pub struct Game {
     pub models: HandleList<model::Model>,
     pub model_matrix_stack: Vec<[f32; 16]>,
     pub auto_draw: bool,
+    pub mods_menu_open: bool,
+    pub mods_click_handled: bool,
+    pub gb_filter_active: bool,
+    pub online_menu_open: bool,
+    pub online_menu_dismissed: bool,
+    pub online_menu_from_main: bool,
+    pub online_menu_ignore_trigger: bool,
+    pub online_menu_just_opened: bool,
+    pub online_menu_selection: usize,
+    pub interaction_menu_open: bool,
+    pub interaction_menu_selection: usize,
+    pub interaction_menu_just_opened: bool,
+    pub interaction_target: Option<u64>,
+    pub interaction_target_name: String,
+    pub interaction_request: Option<(u64, String, String, String)>,
+    pub interaction_response: Option<(String, bool)>,
+    pub interaction_pending_kind: Option<String>,
+    pub battle_pending: bool,
+    pub battle_target: Option<u64>,
+    pub battle_sync_active: bool,
+    pub battle_opponent: Option<u64>,
+    pub battle_remote_mask: u32,
+    pub battle_room: Option<i32>,
+    pub last_battle_input: Instant,
     pub uninit_fields_are_zero: bool,
     pub uninit_args_are_zero: bool,
     pub swap_creation_events: bool,
 
     pub potential_step_settings: pathfinding::PotentialStepSettings,
 
-    pub fps: u32,                 // initially 0
+    pub fps: u32,                 // logic/room speed, initially 0
     pub frame_counter: u32,       // for FPS - gets set to 0 about once per second
+    /// Frames actually presented per second. This is what the optional in-game overlay shows.
+    pub render_fps: u32,
+    /// Whether the optional FPS overlay is drawn by the engine.
+    pub show_fps: bool,
     pub transition_kind: i32,     // default 0
     pub transition_steps: i32,    // default 80
     pub cursor_sprite: i32,       // default -1
@@ -202,6 +231,10 @@ pub struct Game {
     pub error_last: gml::String,
     pub keyboard_string: gml::String,
     pub keyboard_lastchar: gml::String,
+    /// The help text `load_info` read (the raw RTF), kept for `show_info` to parse.
+    pub info_text: Option<gml::String>,
+    /// Window-sized offscreen surface the information window draws into, reused between openings.
+    pub info_surface: Option<(u32, u32, crate::render::atlas::AtlasRef)>,
 
     pub game_id: i32,
     pub program_directory: gml::String,
@@ -221,9 +254,22 @@ pub struct Game {
     pub stored_events: VecDeque<replay::Event>,
     pub frame_limiter: bool, // whether to limit FPS of gameplay by room_speed
     pub frame_limit_at: usize, // on which frame to start limiting FPS
+    /// How drawing is paced relative to the game's fixed step. Set from `OPENGMK_RENDER` when the
+    /// normal game loop starts.
+    pub render_mode: crate::render::RenderMode,
+    /// Position between the previous and current game steps that the next drawn frame shows.
+    pub interp_alpha: f64,
+    /// True while drawing a frame that is not the one belonging to the current game step. Draw
+    /// events run in this mode too, but anything that would change game state is suppressed.
+    pub interp_draw: bool,
+    /// The canonical draw of a step updates the views; the extra frames only read them.
+    pub interp_update_views: bool,
+    /// View state before the current step, used to interpolate the camera.
+    pub prev_views: Option<Vec<View>>,
     pub ffmpeg_recorder: Option<Child>,
 
     pub audio: audio::AudioManager,
+    pub reloaded_online: crate::reloaded_online::ReloadedOnline,
 
     // winit windowing
     pub window: Window,
@@ -1062,9 +1108,7 @@ impl Game {
             .into_iter()
             .map(|t| {
                 t.map(|b| {
-                    // Compile a corrected copy of known-broken scripts, without touching the game.
-                    let original = String::from_utf8_lossy(&b.source.0);
-                    let fixed = crate::patches::fixup(&b.name.to_string(), &original);
+                    let fixed = crate::mods::script_override(&b.name.to_string());
                     let source: &[u8] = match &fixed {
                         Some(text) => text.as_bytes(),
                         None => &b.source.0,
@@ -1305,6 +1349,7 @@ impl Game {
 
         renderer.push_atlases(atlases)?;
 
+        let reloaded_online = crate::reloaded_online::ReloadedOnline::new(program_directory);
         let mut game = Self {
             compiler,
             text_files: HandleArray::new(),
@@ -1366,6 +1411,30 @@ impl Game {
             models: HandleList::new(),
             model_matrix_stack: Vec::new(),
             auto_draw: true,
+            mods_menu_open: false,
+            mods_click_handled: false,
+            gb_filter_active: false,
+            online_menu_open: false,
+            online_menu_dismissed: false,
+            online_menu_from_main: false,
+            online_menu_ignore_trigger: false,
+            online_menu_just_opened: false,
+            online_menu_selection: 1,
+            interaction_menu_open: false,
+            interaction_menu_selection: 0,
+            interaction_menu_just_opened: false,
+            interaction_target: None,
+            interaction_target_name: String::new(),
+            interaction_request: None,
+            interaction_response: None,
+            interaction_pending_kind: None,
+            battle_pending: false,
+            battle_target: None,
+            battle_sync_active: false,
+            battle_opponent: None,
+            battle_remote_mask: 0,
+            battle_room: None,
+            last_battle_input: Instant::now(),
             last_instance_id,
             last_tile_id,
             uninit_fields_are_zero: settings.zero_uninitialized_vars,
@@ -1393,9 +1462,16 @@ impl Game {
             clock: GameClock::SpoofedNanos(0), // to avoid accessing the system timer for now
             frame_limiter,
             frame_limit_at,
+            render_mode: crate::render::RenderMode::Native,
+            interp_alpha: 1.0,
+            interp_draw: false,
+            interp_update_views: true,
+            prev_views: None,
             ffmpeg_recorder,
             fps: 0,
             frame_counter: 0,
+            render_fps: 0,
+            show_fps: false,
             parameters: game_arguments,
             encoding,
             esc_close_game: settings.esc_close_game,
@@ -1407,7 +1483,10 @@ impl Game {
             error_last: "".to_string().into(),
             keyboard_string: "".to_string().into(),
             keyboard_lastchar: "".to_string().into(),
+            info_text: None,
+            info_surface: None,
             audio,
+            reloaded_online,
             window,
             window_border,
             window_icons,
@@ -1689,7 +1768,11 @@ impl Game {
         // Update some stored vars
         let mut room_state = room_state;
         std::mem::swap(&mut self.room, &mut room_state);
-        if self.room.persistent && !self.game_start {
+        // Tras el swap, `room_state` es la sala que se abandona y `self.room` la nueva. Una sala se
+        // guarda (para restaurarla al volver) si ES ELLA la persistente, no la que se entra: la
+        // mochila marca persistente la sala del combate y se va a la del menu, y al mirar el flag
+        // de la sala nueva no se guardaba el combate, reiniciandolo al volver.
+        if room_state.persistent && !self.game_start {
             self.stored_rooms.push(room_state);
         }
         // clearing input here breaks direct keyboard checks, so just step instead
@@ -1915,6 +1998,327 @@ impl Game {
         Ok(Default::default())
     }
 
+    /// Keeps the on-screen controls' idea of the game's state current: which room, and whether a
+    /// dialogue box is open.
+    ///
+    /// Called wherever the game draws, not only once per frame: the game shows a dialogue from
+    /// inside its own wait loop (it calls `screen_redraw` while it waits for a key), so the frame
+    /// loop does not come back round until the dialogue is over, and sampling there would never see
+    /// one.
+    #[cfg(target_os = "android")]
+    pub(crate) fn sync_overlay(&self) {
+        // The touch overlay tells taps from drags in the bag by knowing which room/modal it is in.
+        let room_name = self.assets.rooms.get_asset(self.room.id).map(|r| r.name.to_string().to_ascii_lowercase()).unwrap_or_default();
+        // Title, character selection and the intro happen before there is a player to show. They
+        // must not report a character (the selection changes it on every key, which would upload a
+        // head each time); the chat right after selection is where the chosen player appears.
+        let no_player_room = room_name.starts_with("inicio") || room_name.starts_with("select") || room_name.starts_with("intro");
+        static LAST_NO_PLAYER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static LAST_CHAR: std::sync::Mutex<Option<(i32, i32, i32)>> = std::sync::Mutex::new(None);
+        let was_no_player = LAST_NO_PLAYER.swap(no_player_room, std::sync::atomic::Ordering::Relaxed);
+        if no_player_room && !was_no_player {
+            // Forget the previous game's player so the chat reports the new one even if it is the
+            // same character, and so the sprite is exported again.
+            crate::android_main::reset_player_reports();
+            if let Ok(mut last) = LAST_CHAR.lock() {
+                *last = None;
+            }
+        }
+        // The Discord integration shows the room the player is in; report it verbatim (original
+        // casing) and only when it changes. The closure keeps the name decode off the common path.
+        crate::android_main::report_route(self.room.id, || {
+            self.assets.rooms.get_asset(self.room.id).map(|r| r.name.to_string()).unwrap_or_default()
+        });
+        // `global.battle` is the battle *mode* (0 wild, 1 trainer, -1 outside), set by `BattleMode`,
+        // and the game never resets it when the battle ends. The actual battle is the set of
+        // instances created for it: `Pokemon1` (0, the player's active Pokémon), `Pokemon2` (4, the
+        // enemy), `Trainer1` (7) and `Trainer2` (9, the trainers in trainer battles). They are
+        // destroyed when the battle ends and recreated on every switch, hence the short grace.
+        let battle_type = self.global_number(b"battle", 0).unwrap_or(-1);
+        let battle_instances = [0, 4, 7, 9].iter().any(|&object| self.room.instance_list.count(object) > 0);
+        static LAST_BATTLE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+        if battle_instances {
+            if let Ok(mut last) = LAST_BATTLE.lock() {
+                *last = Some(std::time::Instant::now());
+            }
+        }
+        let in_battle = battle_instances || {
+            let guard = LAST_BATTLE.lock().ok();
+            guard
+                .as_deref()
+                .and_then(|last| *last)
+                .map(|last| last.elapsed().as_millis() < 500)
+                .unwrap_or(false)
+        };
+        let prota = self.global_number(b"prota_index", 0).unwrap_or(-1);
+        let outfit = self.global_number(b"prota_vestuario", 0).unwrap_or(1);
+        let char2 = self.player_char2();
+        // Menu rooms (bag, map, party) destroy the player instance, so `char2` reads as -1 there.
+        // Exporting the sprite in that state did a GPU readback inside the menu and hung the game
+        // thread; the head belongs to the character and only changes in the world.
+        let player_exists = self.room.instance_list.count(14) > 0;
+        // The chat with the professor has no active `obj_Prota` (the player is drawn by the script),
+        // but `global.sprD` already holds the chosen sprite. Export from that there; menus still do
+        // not export (their room names are not the chat's and the player is absent).
+        let charla_room = room_name.starts_with("charla");
+        let can_export = !no_player_room && !in_battle && (player_exists || charla_room);
+        static LAST_EXPORT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+        if !no_player_room {
+            // `LAST_CHAR` is only updated outside battle: the battle uses different sprites, and
+            // remembering them would trigger another readback right when the battle ends. It is
+            // also updated only after a successful export, so an early frame (atlas not ready)
+            // retries instead of leaving the app without a head.
+            if can_export {
+                let char_changed = LAST_CHAR.lock().map(|last| last.as_ref() != Some(&(prota, outfit, char2))).unwrap_or(false);
+                let ready_to_retry = LAST_EXPORT.lock().map(|last| {
+                    last.map(|last| last.elapsed().as_millis() >= 500).unwrap_or(true)
+                }).unwrap_or(false);
+                if char_changed && ready_to_retry {
+                    if let Ok(mut last) = LAST_EXPORT.lock() {
+                        *last = Some(std::time::Instant::now());
+                    }
+                    if self.export_player_sprite(self.player_sprite_index()) {
+                        if let Ok(mut last) = LAST_CHAR.lock() {
+                            *last = Some((prota, outfit, char2));
+                        }
+                    }
+                }
+            }
+            // After the export, so the app reads the fresh sprite instead of the previous one.
+            crate::android_main::report_character(prota, outfit, char2);
+        }
+        // The trainer's nickname (what the player typed when starting), not the character's name.
+        if !no_player_room {
+            if let Some(name) = self.global_string(b"protaname") {
+                if !name.trim().is_empty() {
+                    crate::android_main::report_player_name(name.trim());
+                }
+            }
+        }
+        // Battle state: a trainer battle carries the opponent's name, a wild one does not. The
+        // name can be in `enemigotrainer` (trainers created for the battle) or in `TRAINER_NM`
+        // (scripted rivals and gym leaders, set by their dialogue).
+        // The trainer's name is only trusted for a trainer battle (battle_type != 0); otherwise it
+        // could be a stale dialogue name.
+        let trainer = if battle_type != 0 {
+            [b"enemigotrainer".as_slice(), b"TRAINER_NM".as_slice(), b"enemigotrainer2".as_slice(), b"enemigotrainer3".as_slice()]
+                .iter()
+                .filter_map(|name| self.global_string(name))
+                .map(|name| name.trim().to_string())
+                .find(|name| !name.is_empty() && !name.eq_ignore_ascii_case("salvaje"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        crate::android_main::report_battle(
+            in_battle,
+            &trainer,
+            self.global_number(b"pkmn2", 0).unwrap_or(-1),
+        );
+        crate::touch_navigation::report(self.room.id, self.modal_system(), room_name.contains("mochila") || room_name.contains("bagroom"));
+        crate::touch_controls::set_room(self.room.id);
+        crate::touch_controls::set_dialogue(self.dialogue_open());
+        crate::touch_controls::set_box_open(self.inside_box());
+        crate::touch_controls::set_text_entry(self.text_entry_open());
+        crate::touch_controls::set_picker_boxes(self.picker_boxes());
+        crate::touch_controls::set_modal_open(self.modal_system() > 0);
+        crate::touch_controls::set_modal_id(self.modal_system());
+        crate::touch_controls::set_party(self.party_species());
+    }
+
+    /// Each party slot's stored species value (0 = empty) straight from `global.pkmn1[0..5]`.
+    #[cfg(target_os = "android")]
+    fn party_species(&self) -> [i32; crate::touch_controls::PICKER_SLOTS] {
+        let mut species = [0; crate::touch_controls::PICKER_SLOTS];
+        for (index, slot) in species.iter_mut().enumerate() {
+            *slot = self.global_number(b"pkmn1", index as u32).unwrap_or(0);
+        }
+        species
+    }
+
+    /// The picker's characters as boxes in the window (fractions of it), left to right; empty when
+    /// this frame drew nothing character-sized.
+    ///
+    /// The renderer keeps the boxes in the game's own coordinates: the view moves a room coordinate
+    /// into the picture, and the picture sits somewhere in the window, so both steps are applied here.
+    #[cfg(target_os = "android")]
+    fn picker_boxes(&self) -> Vec<(f32, f32, f32, f32)> {
+        let sprites = crate::touch_controls::character_sprites();
+        let (window_w, window_h) = self.window_inner_size;
+        let Some(view) = self.room.views.first() else { return Vec::new() };
+        if window_w == 0 || window_h == 0 {
+            return Vec::new()
+        }
+        let to_window = |x: f64, y: f64| {
+            let game_x = (x - f64::from(view.source_x)).round() as i32;
+            let game_y = (y - f64::from(view.source_y)).round() as i32;
+            let (wx, wy) = self.game_to_window(game_x, game_y);
+            (wx as f32 / window_w as f32, wy as f32 / window_h as f32)
+        };
+        let boxes: Vec<(f32, f32, f32, f32)> = sprites
+            .iter()
+            .map(|&(x1, y1, x2, y2)| {
+                let (left, top) = to_window(x1, y1);
+                let (right, bottom) = to_window(x2, y2);
+                (left, top, right, bottom)
+            })
+            // A box that covers most of the picture is not a character: something else got counted.
+            .filter(|&(left, top, right, bottom)| {
+                (right - left) <= 0.8 && (bottom - top) <= 0.8 && (bottom - top) > 0.0
+            })
+            .collect();
+        boxes
+    }
+
+    /// The sprite the player is drawn with (the base roster and custom characters alike).
+    #[cfg(target_os = "android")]
+    fn player_sprite_index(&self) -> i32 {
+        // `obj_Prota` (object 14) is the player. Its instance id changes when a save is loaded or
+        // the room is rebuilt, so look it up by object index, not by `get_by_instid(3)`.
+        if let Some(handle) = self.room.instance_list.iter_by_object(14).next(&self.room.instance_list) {
+            let sprite = self.room.instance_list.get(handle).sprite_index.get();
+            if sprite >= 0 {
+                return sprite
+            }
+        }
+        self.global_number(b"sprD", 0).unwrap_or(-1)
+    }
+
+    /// Writes the player's current sprite to `files/rpc-player.png`, head up.
+    #[cfg(target_os = "android")]
+    fn export_player_sprite(&self, id: i32) -> bool {
+        if id < 0 {
+            return false
+        }
+        let Some(sprite) = self.assets.sprites.get_asset(id) else { return false };
+        let Some(frame) = sprite.frames.first() else { return false };
+        let pixels = self.renderer.dump_sprite(frame.atlas_ref);
+        let expected = (frame.width * frame.height * 4) as usize;
+        if pixels.len() != expected || pixels.is_empty() {
+            return false
+        }
+        let Some(image) = image::RgbaImage::from_raw(frame.width, frame.height, pixels.to_vec()) else {
+            return false
+        };
+        // The atlas already stores the sprite head-up: the readback comes out in the same order.
+        let path = crate::android_main::storage_path("rpc-player.png");
+        if image.save(&path).is_ok() {
+            eprintln!("[rpc] sprite del jugador exportado: {} ({}x{})", id, frame.width, frame.height);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The custom trainer id of the player instance (`(3).char2`), or -1 for the base roster.
+    #[cfg(target_os = "android")]
+    fn player_char2(&self) -> i32 {
+        let Some(field_id) = self.compiler.find_field_id(b"char2") else {
+            return -1
+        };
+        // `char2` is a field of the `Control` object (3); fall back to the player (14).
+        for object in [3, 14] {
+            let Some(handle) = self.room.instance_list.iter_by_object(object).next(&self.room.instance_list) else {
+                continue
+            };
+            let instance = self.room.instance_list.get(handle);
+            let fields = instance.fields.borrow();
+            if let Some(crate::gml::Value::Real(value)) = fields.get(&field_id).and_then(|field| field.get(0)) {
+                return value.into_inner() as i32
+            }
+        }
+        -1
+    }
+
+    /// A string in a GML global, if the game has declared it.
+    #[cfg(target_os = "android")]
+    fn global_string(&self, name: &[u8]) -> Option<std::string::String> {
+        let field_id = self.compiler.find_field_id(name)?;
+        match self.globals.fields.get(&field_id)?.get(0)? {
+            crate::gml::Value::Str(value) => Some(value.decode_utf8().into_owned()),
+            _ => None,
+        }
+    }
+
+    /// Some number in a GML global, if the game has declared it.
+    #[cfg(target_os = "android")]
+    fn global_number(&self, name: &[u8], index: u32) -> Option<i32> {
+        let field_id = self.compiler.find_field_id(name)?;
+        match self.globals.fields.get(&field_id)?.get(index)? {
+            crate::gml::Value::Real(n) => Some(n.into_inner() as i32),
+            _ => None,
+        }
+    }
+
+    /// The id of the modal the game is drawing, or a negative code when it cannot be read:
+    /// -1 nothing open, -2 the variable is unknown to the compiler, -3 not present in the globals.
+    #[cfg(target_os = "android")]
+    fn modal_system(&self) -> i32 {
+        let Some(field_id) = self.compiler.find_field_id(b"drawModalSystem") else {
+            return -2
+        };
+        let Some(field) = self.globals.fields.get(&field_id) else {
+            return -3
+        };
+        let Some(modal) = field.get(0) else {
+            return -1
+        };
+        match modal {
+            crate::gml::Value::Real(n) => n.into_inner() as i32,
+            _ => -4,
+        }
+    }
+
+    /// True while the game is showing one of its dialogue boxes, so the touch overlay can step aside
+    /// and leave a single button to advance it.
+    ///
+    /// The game draws its dialogues (and the rest of its modals) through a script whose id it keeps
+    /// in `global.drawModalSystem`; -1 means nothing is open. 6937 is the box with a portrait, 6949
+    /// the plain one and 6941 the mobile one.
+    #[cfg(target_os = "android")]
+    fn dialogue_open(&self) -> bool {
+        matches!(self.modal_system(), 6937 | 6949 | 6941)
+    }
+
+    /// True while the game's own Pokémon box (the PC storage) is open. There is no single room id to
+    /// look at - the box can be reached from several places - but the game keeps `global.ENCAJA` set
+    /// while it is showing, and that is what tells it apart.
+    #[cfg(target_os = "android")]
+    fn inside_box(&self) -> bool {
+        self.global_number(b"ENCAJA", 0).is_some_and(|value| value != 0)
+    }
+
+    /// True while the game is showing its text-entry dialog, the one that draws the on-screen
+    /// keyboard (GML script 7754). The Android side raises the system keyboard while it is open.
+    #[cfg(target_os = "android")]
+    fn text_entry_open(&self) -> bool {
+        self.modal_system() == 7754
+    }
+
+    /// Slides the picture when the system keyboard comes or goes.
+    ///
+    /// The game sits inside its text dialog and only redraws when a key arrives, so the frame on
+    /// screen is the one drawn before the keyboard appeared or after it left. That left the pan one
+    /// step behind - and the game stuck up top once the keyboard was gone. Presenting the frame that
+    /// is already drawn is enough to move it, and it costs only the blit.
+    #[cfg(target_os = "android")]
+    fn represent_if_ime_moved(&mut self) {
+        // The interpolation pass is already drawing; presenting from inside it would flush the
+        // queue halfway through. Its own present, a few instructions later, sees the new inset.
+        if self.interp_draw {
+            return
+        }
+        static LAST_INSET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let inset = crate::touch_controls::text_entry_inset();
+        if LAST_INSET.swap(inset, std::sync::atomic::Ordering::Relaxed) == inset {
+            return
+        }
+        if self.play_type != PlayType::Record {
+            let (width, height) = self.window_inner_size;
+            self.renderer.present(width, height, self.scaling);
+        }
+    }
+
     /// Runs a frame loop and draws the screen. Exits immediately, without waiting for any FPS limitation.
     pub fn frame(&mut self) -> gml::Result<()> {
         // Nothing to draw to while the activity has the window, which is exactly when the app is in
@@ -1933,17 +2337,90 @@ impl Game {
 
         #[cfg(target_os = "android")]
         {
+            // The driver lost the context (rare, usually a GPU reset). Every GL object the game
+            // holds belongs to the old one, so the only safe recovery is a new session: end this
+            // one cleanly instead of drawing garbage or dying on the first GL error.
+            if crate::render::opengl::egl::context_lost() {
+                eprintln!("[gl] contexto perdido: terminando la sesion para reconstruir el renderer");
+                self.scene_change = Some(SceneChange::End);
+                return Ok(())
+            }
+            // Bind/release first: after a destroyed surface the context may still be current on
+            // this thread, which makes the next eglCreateWindowSurface fail with EGL_BAD_ALLOC.
+            unsafe { crate::render::opengl::egl::bind_surface() };
             if !crate::render::opengl::egl::has_surface() {
                 return Ok(())
             }
-            // The window may have been replaced while we were away, so bind whatever is current now,
-            // before the frame touches anything at all.
-            unsafe { crate::render::opengl::egl::bind_surface() };
+        }
+
+        self.battle_input_tick();
+
+        let mods_was_open = self.mods_menu_open;
+        self.mods_menu_input();
+        if mods_was_open || self.mods_menu_open {
+            self.draw()?;
+            if self.auto_draw && self.scene_change.is_none() && self.play_type != PlayType::Record {
+                self.renderer.set_gb_inverted(self.gb_menu_palette());
+                self.renderer.present(self.window_inner_size.0, self.window_inner_size.1, self.scaling);
+            }
+            self.input.step();
+            return Ok(())
+        }
+
+        if self.input.keyboard_check_pressed(input::Button::F3 as u8) {
+            eprintln!("[battle-test] F3");
+            let _ = self.start_test_battle();
+        }
+
+        // Intercept the main menu's Multijugador action before InicioControl opens the game's
+        // classic confirmation dialog. This is an engine-level overlay; no GML is changed.
+        if self.online_menu_ignore_trigger && !self.input.keyboard_check(input::Button::M as u8) {
+            self.online_menu_ignore_trigger = false;
+        }
+        if self.play_type == PlayType::Normal
+            && self.room.id == 30
+            && !self.online_menu_open
+            && !self.online_menu_ignore_trigger
+            && self.online_menu_trigger()
+        {
+            self.online_menu_open = true;
+            self.online_menu_from_main = true;
+            self.online_menu_just_opened = true;
+            self.online_menu_selection = 1;
+        }
+        if self.online_menu_open {
+            if self.online_menu_just_opened {
+                self.online_menu_just_opened = false;
+            } else {
+                self.online_menu_input();
+            }
+            self.draw()?;
+            if self.auto_draw && self.scene_change.is_none() && self.play_type != PlayType::Record {
+                self.renderer.set_gb_inverted(self.gb_menu_palette());
+                self.renderer.present(self.window_inner_size.0, self.window_inner_size.1, self.scaling);
+            }
+            if self.scene_change.is_some() {
+                eprintln!("[online-menu] leaving frame room={} scene_change set", self.room.id);
+            }
+            self.input.step();
+            return Ok(())
+        }
+
+        self.interaction_trigger();
+        if self.interaction_any_open() {
+            self.interaction_input();
+            self.draw()?;
+            if self.auto_draw && self.scene_change.is_none() && self.play_type != PlayType::Record {
+                self.renderer.set_gb_inverted(self.gb_menu_palette());
+                self.renderer.present(self.window_inner_size.0, self.window_inner_size.1, self.scaling);
+            }
+            self.input.step();
+            return Ok(())
         }
 
         // The touch overlay shows different controls depending on where we are in the game.
         #[cfg(target_os = "android")]
-        crate::touch_controls::set_room(self.room.id);
+        self.sync_overlay();
 
         if self.esc_close_game && self.input.keyboard_lastkey() == input::Button::Escape as u8 {
             self.scene_change = Some(SceneChange::End);
@@ -2102,6 +2579,10 @@ impl Game {
         // Clear out any deleted instances
         self.room.instance_list.remove_with(|instance| instance.state.get() == InstanceState::Deleted);
 
+        // Resolve online player collisions before drawing so the corrected position is what
+        // actually gets rendered (instead of moving forward for one frame and snapping back).
+        self.reloaded_online.fix_collisions(&self.room, &self.assets);
+
         // Draw everything, including running draw events
         if self.auto_draw {
             self.draw()?;
@@ -2119,6 +2600,7 @@ impl Game {
             let instance = self.room.instance_list.get(handle);
             let new_index = instance.image_index.get() + instance.image_speed.get();
             instance.image_index.set(new_index);
+            instance.bbox_is_stale.set(true);
             let frame_count = self
                 .assets
                 .sprites
@@ -2127,6 +2609,7 @@ impl Game {
                 .unwrap_or(0.0);
             if new_index.into_inner() >= frame_count {
                 instance.image_index.set(new_index - Real::from(frame_count));
+                instance.bbox_is_stale.set(true);
                 self.run_instance_event(ev::OTHER, 7, handle, handle, None)?; // animation end event
             }
         }
@@ -2134,8 +2617,11 @@ impl Game {
 
         // Tell renderer to finish the frame
         if self.auto_draw && self.scene_change.is_none() && self.play_type != PlayType::Record {
+            self.renderer.set_gb_inverted(self.gb_menu_palette());
             self.renderer.present(self.window_inner_size.0, self.window_inner_size.1, self.scaling);
         }
+
+        self.reloaded_online.tick(&self.room, &self.assets);
 
         // Clear inputs for this frame
         self.input.step();
@@ -2143,8 +2629,826 @@ impl Game {
         Ok(())
     }
 
+    fn is_menu_room(&self) -> bool {
+        let name = self
+            .assets
+            .rooms
+            .get_asset(self.room.id)
+            .map(|room| room.name.to_string().to_ascii_lowercase())
+            .unwrap_or_default();
+        name.contains("menu")
+            || name.contains("inicio")
+            || name.contains("loader")
+            || name.contains("option")
+            || name.contains("opcion")
+            || name.contains("credito")
+            || name.contains("copy")
+            || name.contains("splash")
+            || name.contains("intro")
+            || name.contains("select")
+    }
+
+    fn gb_menu_palette(&self) -> bool {
+        self.is_menu_room()
+    }
+
+    fn apply_visual_settings(&mut self, root: &std::path::Path) {
+        let gb = crate::mods::gb_settings(root);
+        self.gb_filter_active = gb.is_some();
+        self.renderer.set_crt(crate::mods::crt_settings(root));
+        self.renderer.set_gb(gb);
+        self.audio.set_gb_audio(crate::mods::gb_audio_settings(root));
+    }
+
+    pub(crate) fn gb_script_skipped(&self, script_id: i32) -> bool {
+        if !self.gb_filter_active {
+            return false;
+        }
+        self.assets
+            .scripts
+            .get_asset(script_id)
+            .map(|script| {
+                matches!(
+                    script.name.as_ref(),
+                    b"DrawOutdoorLighting" | b"DayNightManageCielo" | b"InitializeCielo"
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    fn toggle_mod(&mut self, root: &std::path::Path, id: &str) {
+        let enabled = crate::mods::is_enabled(root, id);
+        if crate::mods::set_enabled(root, id, !enabled) {
+            eprintln!("[mods] {} alternado a {}", id, if enabled { "OFF" } else { "ON" });
+            self.apply_visual_settings(root);
+        }
+    }
+
+    fn game_root(&self) -> PathBuf {
+        PathBuf::from(self.decode_str(self.program_directory.as_ref()).into_owned())
+    }
+
+    fn mods_available(&self) -> bool {
+        self.game_root().join("mods/active.flag").is_file()
+    }
+
+    fn mods_menu_lines(&self) -> Vec<String> {
+        std::fs::read_to_string(self.game_root().join("mods/menu.txt"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn mods_button_rect(&self) -> (i32, i32, i32, i32) {
+        let w = self.unscaled_width as i32;
+        (w - 64, 8, w - 8, 28)
+    }
+
+    fn mods_menu_panel(&self) -> (i32, i32, i32, i32) {
+        let w = self.unscaled_width as i32;
+        let h = self.unscaled_height as i32;
+        (w / 16, h / 16, w * 15 / 16, h * 15 / 16)
+    }
+
+    fn mods_menu_row(&self, index: usize) -> (i32, i32, i32, i32) {
+        let (x1, y1, x2, y2) = self.mods_menu_panel();
+        let row_h = ((y2 - y1 - 58) / 7).clamp(12, 18);
+        let top = y1 + 30 + index as i32 * row_h;
+        (x1 + 8, top, x2 - 8, top + row_h)
+    }
+
+    fn mods_menu_close_rect(&self) -> (i32, i32, i32, i32) {
+        let (x1, _, x2, y2) = self.mods_menu_panel();
+        let center = (x1 + x2) / 2;
+        (center - 40, y2 - 28, center + 40, y2 - 10)
+    }
+
+    fn mods_menu_input(&mut self) {
+        if !self.input.mouse_check_button(1) {
+            self.mods_click_handled = false;
+        }
+        let available = self.mods_available();
+        if !available && !self.mods_menu_open {
+            return;
+        }
+        if !self.mods_menu_open {
+            if self.room.id != 30 || !self.input.mouse_check_button_pressed(1) || self.mods_click_handled {
+                return;
+            }
+            self.mods_click_handled = true;
+            let (x, y) = (self.input.mouse_x(), self.input.mouse_y());
+            let (x1, y1, x2, y2) = self.mods_button_rect();
+            if x >= x1 && x <= x2 && y >= y1 && y <= y2 {
+                self.mods_menu_open = true;
+            }
+            return;
+        }
+        if self.input.keyboard_check_pressed(input::Button::Escape as u8) {
+            self.mods_menu_open = false;
+            return;
+        }
+        if !self.input.mouse_check_button_pressed(1) || self.mods_click_handled {
+            return;
+        }
+        self.mods_click_handled = true;
+        let (x, y) = (self.input.mouse_x(), self.input.mouse_y());
+        let root = self.game_root();
+        let lines = self.mods_menu_lines();
+        for (index, line) in lines.iter().take(7).enumerate() {
+            let (x1, y1, x2, y2) = self.mods_menu_row(index);
+            if x >= x1 && x <= x2 && y >= y1 && y <= y2 {
+                let name = line.split("  [").next().unwrap_or("").trim().to_ascii_lowercase();
+                let id = if name == "crt" {
+                    Some("crt")
+                } else if name == "game boy" || name == "gb" {
+                    Some("gb")
+                } else {
+                    None
+                };
+                if let Some(id) = id {
+                    self.toggle_mod(&root, id);
+                }
+                return;
+            }
+        }
+        let (x1, y1, x2, y2) = self.mods_menu_close_rect();
+        if x >= x1 && x <= x2 && y >= y1 && y <= y2 {
+            self.mods_menu_open = false;
+        }
+    }
+
+    fn online_menu_panel(&self) -> (i32, i32, i32, i32) {
+        let w = self.unscaled_width as i32;
+        let h = self.unscaled_height as i32;
+        (w / 16, h / 10, w * 15 / 16, h * 9 / 10)
+    }
+
+    fn online_menu_row(&self, index: usize) -> (i32, i32, i32, i32) {
+        let (x1, y1, x2, y2) = self.online_menu_panel();
+        let row_h = ((y2 - y1) / 8).max(1);
+        let top = y1 + row_h + index as i32 * row_h;
+        (x1 + 8, top, x2 - 8, top + row_h)
+    }
+
+    fn inicio_control_multijugador_selected(&self) -> bool {
+        let Some(object_index) = self.assets.objects.iter().position(|object| {
+            object
+                .as_ref()
+                .map(|object| object.name.as_ref() == b"InicioControl")
+                .unwrap_or(false)
+        }) else {
+            return false
+        };
+        let Some(handle) = self
+            .room
+            .instance_list
+            .iter_by_identity(object_index as crate::types::ID)
+            .next(&self.room.instance_list)
+        else {
+            return false
+        };
+        let Some(field_id) = self.compiler.find_field_id(b"SEL") else { return false };
+        let instance = self.room.instance_list.get(handle);
+        let value = instance.fields.borrow().get(&field_id).and_then(|field| field.get(0));
+        matches!(value, Some(gml::Value::Real(value)) if value.into_inner() == 2.0)
+    }
+
+    fn online_menu_trigger(&self) -> bool {
+        if self.input.keyboard_check_pressed(input::Button::M as u8) {
+            return true
+        }
+        if self.inicio_control_multijugador_selected()
+            && (self.input.keyboard_check_pressed(input::Button::Return as u8)
+                || self.input.keyboard_check_pressed(input::Button::Space as u8))
+        {
+            return true
+        }
+        if self.input.mouse_check_button_pressed(1) {
+            let (x, y) = (self.input.mouse_x(), self.input.mouse_y());
+            if (62..=178).contains(&x) && (111..=124).contains(&y) {
+                return true
+            }
+        }
+        false
+    }
+
+    fn online_menu_input(&mut self) {
+        let mut selection = self.online_menu_selection.min(2);
+        let mut activate = false;
+        if self.input.keyboard_check_pressed(input::Button::UpArrow as u8) {
+            selection = (selection + 2) % 3;
+        }
+        if self.input.keyboard_check_pressed(input::Button::DownArrow as u8) {
+            selection = (selection + 1) % 3;
+        }
+        if self.input.keyboard_check_pressed(input::Button::Return as u8)
+            || self.input.keyboard_check_pressed(input::Button::Space as u8)
+        {
+            activate = true;
+        }
+        if self.input.keyboard_check_pressed(input::Button::Escape as u8) {
+            selection = 2;
+            activate = true;
+        }
+        if self.input.mouse_check_button_pressed(1) {
+            let (x, y) = (self.input.mouse_x(), self.input.mouse_y());
+            for index in 0..3 {
+                let (x1, y1, x2, y2) = self.online_menu_row(index);
+                if x >= x1 && x <= x2 && y >= y1 && y <= y2 {
+                    selection = index;
+                    activate = true;
+                    break
+                }
+            }
+        }
+        self.online_menu_selection = selection;
+        if !activate {
+            return
+        }
+        self.online_menu_open = false;
+        self.online_menu_dismissed = true;
+        let from_main = self.online_menu_from_main;
+        self.online_menu_from_main = false;
+        eprintln!("[online-menu] activate selection={selection} from_main={from_main} room={}", self.room.id);
+        match selection {
+            0 => {
+                self.reloaded_online.stop();
+                if from_main {
+                    // Let the game's normal Local flow continue, including its classic dialog.
+                    self.online_menu_ignore_trigger = true;
+                    self.input.keyboard_key_press(input::Button::M as i32);
+                }
+            },
+            1 => {
+                // Local server mode: connect to the configured reloaded-online-server and open
+                // the game's loader. Clear the selection input so LoaderControl does not see the
+                // same Enter/click and immediately back out to the main menu.
+                self.input.keyboard_clear_all();
+                self.input.mouse_release(1, false);
+                self.reloaded_online.start_own();
+                self.scene_change = Some(SceneChange::Room(43));
+            },
+            _ => (),
+        }
+    }
+
+    fn set_instance_number(&mut self, handle: usize, name: &[u8], value: f64) {
+        self.set_instance_array_number(handle, name, 0, value);
+    }
+
+    fn set_instance_array_number(&mut self, handle: usize, name: &[u8], index: u32, value: f64) {
+        let field = self.compiler.get_field_id(name);
+        let instance = self.room.instance_list.get(handle);
+        instance
+            .fields
+            .borrow_mut()
+            .entry(field)
+            .or_insert_with(|| Field::new(index, gml::Value::Real(Real::from(value))))
+            .set(index, gml::Value::Real(Real::from(value)));
+    }
+
+    fn copy_global_array(&mut self, from: &[u8], to: &[u8]) {
+        for index in 0..6u32 {
+            let value = self
+                .variable_global_array_get(&[gml::Value::Str(gml::String::from(from)), index.into()])
+                .unwrap_or_default();
+            let _ = self.variable_global_array_set(&[
+                gml::Value::Str(gml::String::from(to)),
+                index.into(),
+                value,
+            ]);
+        }
+    }
+
+    fn local_player_sprite(&self) -> Option<i32> {
+        let object_index = self.assets.objects.iter().position(|object| {
+            object
+                .as_ref()
+                .map(|object| object.name.as_ref() == b"obj_Prota")
+                .unwrap_or(false)
+        })?;
+        let handle = self
+            .room
+            .instance_list
+            .iter_by_identity(object_index as crate::types::ID)
+            .next(&self.room.instance_list)?;
+        Some(self.room.instance_list.get(handle).sprite_index.get())
+    }
+
+    fn run_instance_script(&mut self, handle: usize, name: &[u8]) -> gml::Result<()> {
+        let Some(script) = self.assets.scripts.iter().find_map(|script| {
+            script
+                .as_ref()
+                .filter(|script| script.name.as_ref() == name)
+                .map(|script| script.compiled.clone())
+        }) else {
+            return Ok(())
+        };
+        let mut context = Context::with_single_instance(handle);
+        self.execute(&script, &mut context)?;
+        Ok(())
+    }
+
+    fn start_test_battle(&mut self) -> gml::Result<()> {
+        let Some(object_index) = self.assets.objects.iter().position(|object| {
+            object
+                .as_ref()
+                .map(|object| object.name.as_ref() == b"MULTIPLAYER")
+                .unwrap_or(false)
+        }) else {
+            return Ok(())
+        };
+        let id = self.instance_create(&[0.0.into(), 0.0.into(), (object_index as i32).into()])?;
+        let instance_id = match id {
+            gml::Value::Real(value) => value.to_i32(),
+            _ => return Ok(()),
+        };
+        let Some(handle) = self.room.instance_list.get_by_instid(instance_id) else {
+            return Ok(())
+        };
+        let local_sprite = self.local_player_sprite().unwrap_or(1860);
+        let local_index = match self
+            .variable_global_array_get(&[gml::Value::Str(gml::String::from("prota_index")), 0.into()])
+            .unwrap_or_default()
+        {
+            gml::Value::Real(value) => value.into_inner(),
+            _ => 0.0,
+        };
+        self.set_instance_number(handle, b"p2_sprR", local_sprite as f64);
+        self.set_instance_number(handle, b"sprINDEX2", local_sprite as f64);
+        self.set_instance_number(handle, b"index2", local_index);
+        self.set_instance_number(handle, b"sp_char2", 0.0);
+        let _ = self.variable_global_set(&[
+            gml::Value::Str(gml::String::from("ENTR_SPR")),
+            gml::Value::Real(Real::from(local_sprite as f64)),
+        ]);
+        let _ = self.variable_global_set(&[
+            gml::Value::Str(gml::String::from("TRAINER_SPR")),
+            gml::Value::Real(Real::from(local_sprite as f64)),
+        ]);
+        // Test battle: use the local party on both sides.
+        for index in 0..6 {
+            let species = match self
+                .variable_global_array_get(&[gml::Value::Str(gml::String::from("pkmn1")), index.into()])
+                .unwrap_or_default()
+            {
+                gml::Value::Real(value) => value.into_inner(),
+                _ => 0.0,
+            };
+            self.set_instance_number(handle, b"PKMN1", species);
+            self.set_instance_number(handle, b"PKMN2", species as f64);
+        }
+        self.copy_global_array(b"pkmn1", b"pkmn2");
+        self.copy_global_array(b"indexnivel", b"nivel2");
+        self.copy_global_array(b"pkmnsex1", b"pkmnsex2");
+        self.copy_global_array(b"exp1", b"exp2");
+        self.copy_global_array(b"IV", b"IV2");
+        self.copy_global_array(b"objpoke1", b"objpoke2");
+        self.copy_global_array(b"selue_pk1", b"selue_pk2");
+        self.set_instance_number(handle, b"PLAYER1_INI", 1.0);
+        self.set_instance_number(handle, b"PLAYER2_INI", 1.0);
+        self.set_instance_number(handle, b"NUM_POKEMON1", 6.0);
+        self.set_instance_number(handle, b"NUM_POKEMON2", 6.0);
+        self.run_instance_script(handle, b"MultiplayerImportPlayerOne")?;
+        self.run_instance_script(handle, b"MultiplayerImportPlayerTwo")?;
+        self.run_instance_script(handle, b"MultiplayerGoBattle")?;
+        Ok(())
+    }
+
+    fn global_num(&self, name: &str, index: u32) -> f64 {
+        match self
+            .variable_global_array_get(&[gml::Value::Str(gml::String::from(name)), index.into()])
+            .unwrap_or_default()
+        {
+            gml::Value::Real(value) => value.into_inner(),
+            _ => 0.0,
+        }
+    }
+
+    fn global_json(&self, name: &str, index: u32) -> serde_json::Value {
+        match self
+            .variable_global_array_get(&[gml::Value::Str(gml::String::from(name)), index.into()])
+            .unwrap_or_default()
+        {
+            gml::Value::Real(value) => serde_json::json!(value.into_inner()),
+            gml::Value::Str(value) => serde_json::json!(value.to_string()),
+        }
+    }
+
+    fn set_global_num(&mut self, name: &str, index: u32, value: f64) {
+        let _ = self.variable_global_array_set(&[
+            gml::Value::Str(gml::String::from(name)),
+            index.into(),
+            gml::Value::Real(Real::from(value)),
+        ]);
+    }
+
+    fn set_global_json(&mut self, name: &str, index: u32, value: &serde_json::Value) {
+        let value = if let Some(number) = value.as_f64() {
+            gml::Value::Real(Real::from(number))
+        } else {
+            gml::Value::Str(gml::String::from(value.as_str().unwrap_or("")))
+        };
+        let _ = self.variable_global_array_set(&[
+            gml::Value::Str(gml::String::from(name)),
+            index.into(),
+            value,
+        ]);
+    }
+
+    fn battle_team_snapshot(&self) -> Option<String> {
+        let mut team = Vec::new();
+        for index in 0..6u32 {
+            let moves = (1..=4)
+                .map(|move_index| self.global_json("attack1", index * 32000 + move_index))
+                .collect::<Vec<_>>();
+            let info = (0..17)
+                .map(|field| self.global_json("info", index * 32000 + field))
+                .collect::<Vec<_>>();
+            team.push(serde_json::json!({
+                "species": self.global_num("pkmn1", index),
+                "level": self.global_num("indexnivel", index),
+                "sex": self.global_num("pkmnsex1", index),
+                "exp": self.global_num("exp1", index),
+                "iv": self.global_num("IV", index),
+                "item": self.global_num("objpoke1", index),
+                "selue": self.global_num("selue_pk1", index),
+                "moves": moves,
+                "info": info,
+            }));
+        }
+        serde_json::to_string(&serde_json::json!({ "team": team })).ok()
+    }
+
+    fn apply_remote_battle_team(&mut self, data: &str) -> bool {
+        let Ok(root) = serde_json::from_str::<serde_json::Value>(data) else { return false };
+        let Some(team) = root.get("team").and_then(|value| value.as_array()) else { return false };
+        for (index, pokemon) in team.iter().take(6).enumerate() {
+            let index = index as u32;
+            let number = |key: &str| pokemon.get(key).and_then(|value| value.as_f64()).unwrap_or(0.0);
+            self.set_global_num("pkmn2", index, number("species"));
+            self.set_global_num("nivel2", index, number("level"));
+            self.set_global_num("pkmnsex2", index, number("sex"));
+            self.set_global_num("exp2", index, number("exp"));
+            self.set_global_num("IV2", index, number("iv"));
+            self.set_global_num("objpoke2", index, number("item"));
+            self.set_global_num("selue_pk2", index, number("selue"));
+            if let Some(moves) = pokemon.get("moves").and_then(|value| value.as_array()) {
+                for (move_index, value) in moves.iter().take(4).enumerate() {
+                    self.set_global_json("attack2", index * 32000 + move_index as u32 + 1, value);
+                }
+            }
+            if let Some(info) = pokemon.get("info").and_then(|value| value.as_array()) {
+                for (field, value) in info.iter().take(17).enumerate() {
+                    self.set_global_json("info2", index * 32000 + field as u32, value);
+                }
+            }
+        }
+        true
+    }
+
+    fn start_battle_with_remote_team(&mut self, remote_data: &str, target: u64) -> gml::Result<()> {
+        if !self.apply_remote_battle_team(remote_data) {
+            return Ok(())
+        }
+        let Some(object_index) = self.assets.objects.iter().position(|object| {
+            object
+                .as_ref()
+                .map(|object| object.name.as_ref() == b"MULTIPLAYER")
+                .unwrap_or(false)
+        }) else {
+            return Ok(())
+        };
+        let id = self.instance_create(&[0.0.into(), 0.0.into(), (object_index as i32).into()])?;
+        let instance_id = match id {
+            gml::Value::Real(value) => value.to_i32(),
+            _ => return Ok(()),
+        };
+        let Some(handle) = self.room.instance_list.get_by_instid(instance_id) else {
+            return Ok(())
+        };
+        let local_id = self.reloaded_online.local_id().unwrap_or(1);
+        let seed = (local_id.min(target) * 1_000_003 + local_id.max(target)) as i32;
+        self.rand.set_seed(seed.max(1));
+        let local_sprite = self.local_player_sprite().unwrap_or(1860);
+        let local_index = self.global_num("prota_index", 0);
+        self.set_instance_number(handle, b"p2_sprR", local_sprite as f64);
+        self.set_instance_number(handle, b"sprINDEX2", local_sprite as f64);
+        self.set_instance_number(handle, b"index2", local_index);
+        self.set_instance_number(handle, b"sp_char2", 0.0);
+        self.set_instance_number(handle, b"BTTBACK_INDEX", f64::from((seed.unsigned_abs() % 253) + 1));
+        let _ = self.variable_global_set(&[
+            gml::Value::Str(gml::String::from("ENTR_SPR")),
+            gml::Value::Real(Real::from(local_sprite as f64)),
+        ]);
+        let _ = self.variable_global_set(&[
+            gml::Value::Str(gml::String::from("TRAINER_SPR")),
+            gml::Value::Real(Real::from(local_sprite as f64)),
+        ]);
+        let mut count1: f64 = 0.0;
+        let mut count2: f64 = 0.0;
+        for index in 0..6u32 {
+            let species1 = self.global_num("pkmn1", index);
+            let species2 = self.global_num("pkmn2", index);
+            self.set_instance_array_number(handle, b"PKMN1", index, species1);
+            self.set_instance_array_number(handle, b"PKMN2", index, species2);
+            if species1 > 0.0 {
+                count1 += 1.0;
+            }
+            if species2 > 0.0 {
+                count2 += 1.0;
+            }
+        }
+        self.set_instance_number(handle, b"PLAYER1_INI", 1.0);
+        self.set_instance_number(handle, b"PLAYER2_INI", 1.0);
+        self.set_instance_number(handle, b"NUM_POKEMON1", count1.max(1.0));
+        self.set_instance_number(handle, b"NUM_POKEMON2", count2.max(1.0));
+        self.run_instance_script(handle, b"MultiplayerImportPlayerOne")?;
+        self.run_instance_script(handle, b"MultiplayerImportPlayerTwo")?;
+        self.run_instance_script(handle, b"MultiplayerGoBattle")?;
+        self.battle_sync_active = true;
+        self.battle_opponent = Some(target);
+        self.battle_remote_mask = 0;
+        self.battle_room = None;
+        self.last_battle_input = Instant::now();
+        Ok(())
+    }
+
+    fn battle_input_tick(&mut self) {
+        if !self.battle_sync_active {
+            return
+        }
+        if self.battle_room.is_none() {
+            self.battle_room = Some(self.room.id);
+        } else if self.battle_room != Some(self.room.id) {
+            self.battle_sync_active = false;
+            self.battle_opponent = None;
+            self.battle_remote_mask = 0;
+            return
+        }
+        while let Some((id, mask)) = self.reloaded_online.take_battle_input() {
+            if Some(id) == self.battle_opponent {
+                self.battle_remote_mask = mask;
+            }
+        }
+        let p2_keys = [
+            (input::Button::U as u8, 1u32 << 0),
+            (input::Button::J as u8, 1u32 << 1),
+            (input::Button::H as u8, 1u32 << 2),
+            (input::Button::K as u8, 1u32 << 3),
+            (input::Button::Q as u8, 1u32 << 4),
+            (input::Button::W as u8, 1u32 << 5),
+            (input::Button::E as u8, 1u32 << 6),
+            (input::Button::R as u8, 1u32 << 7),
+            (input::Button::Y as u8, 1u32 << 8),
+            (input::Button::I as u8, 1u32 << 9),
+            (input::Button::O as u8, 1u32 << 10),
+        ];
+        for (key, bit) in p2_keys {
+            self.input.set_key_state(key, self.battle_remote_mask & bit != 0);
+        }
+        let p1_keys = [
+            (input::Button::UpArrow as u8, 1u32 << 0),
+            (input::Button::DownArrow as u8, 1u32 << 1),
+            (input::Button::LeftArrow as u8, 1u32 << 2),
+            (input::Button::RightArrow as u8, 1u32 << 3),
+            (input::Button::Z as u8, 1u32 << 4),
+            (input::Button::X as u8, 1u32 << 5),
+            (input::Button::C as u8, 1u32 << 6),
+            (input::Button::V as u8, 1u32 << 7),
+            (input::Button::S as u8, 1u32 << 8),
+            (input::Button::A as u8, 1u32 << 9),
+            (input::Button::M as u8, 1u32 << 10),
+        ];
+        let mut mask = 0u32;
+        for (key, bit) in p1_keys {
+            if self.input.keyboard_check(key) {
+                mask |= bit;
+            }
+        }
+        if self.last_battle_input.elapsed() >= Duration::from_millis(50) {
+            self.last_battle_input = Instant::now();
+            if let Some(target) = self.battle_opponent {
+                self.reloaded_online.send_battle_input(target, mask);
+            }
+        }
+    }
+
+    fn local_player_position(&self) -> Option<(f64, f64)> {
+        let object_index = self.assets.objects.iter().position(|object| {
+            object
+                .as_ref()
+                .map(|object| object.name.as_ref() == b"obj_Prota")
+                .unwrap_or(false)
+        })?;
+        let handle = self
+            .room
+            .instance_list
+            .iter_by_identity(object_index as crate::types::ID)
+            .next(&self.room.instance_list)?;
+        let instance = self.room.instance_list.get(handle);
+        Some((instance.x.get().into_inner(), instance.y.get().into_inner()))
+    }
+
+    fn interaction_row(&self, index: usize) -> (i32, i32, i32, i32) {
+        let (x1, y1, x2, y2) = self.online_menu_panel();
+        let row_h = ((y2 - y1) / 8).max(1);
+        let top = y1 + row_h + index as i32 * row_h;
+        (x1 + 8, top, x2 - 8, top + row_h)
+    }
+
+    fn interaction_any_open(&self) -> bool {
+        self.interaction_menu_open || self.interaction_request.is_some() || self.interaction_response.is_some()
+    }
+
+    fn interaction_trigger(&mut self) {
+        if !self.reloaded_online.is_active() {
+            return
+        }
+        if self.interaction_any_open() {
+            return
+        }
+        if let Some(request) = self.reloaded_online.take_request() {
+            self.interaction_menu_open = false;
+            self.interaction_request = Some((request.id, request.name, request.kind, request.info));
+            self.interaction_menu_selection = 0;
+            return
+        }
+        if let Some(response) = self.reloaded_online.take_response() {
+            let kind = self.interaction_pending_kind.take();
+            if response.accept && kind.as_deref() == Some("F") {
+                if let Some(data) = self.battle_team_snapshot() {
+                    self.battle_pending = self.reloaded_online.send_battle_team(response.id, &data);
+                    self.battle_target = Some(response.id);
+                    eprintln!("[battle] equipo enviado a {}; esperando equipo remoto", response.name);
+                }
+                return
+            }
+            self.interaction_response = Some((
+                if response.accept {
+                    format!("{} acepto la solicitud.", response.name)
+                } else {
+                    format!("{} rechazo la solicitud.", response.name)
+                },
+                response.accept,
+            ));
+            return
+        }
+        if let Some((id, data)) = self.reloaded_online.take_battle_team() {
+            if self.battle_pending && self.battle_target == Some(id) {
+                self.battle_pending = false;
+                self.battle_target = None;
+                eprintln!("[battle] equipo remoto recibido; arrancando combate");
+                let _ = self.start_battle_with_remote_team(&data, id);
+            }
+            return
+        }
+
+        if !self.input.keyboard_check_pressed(input::Button::Z as u8) {
+            return
+        }
+        let Some((x, y)) = self.local_player_position() else { return };
+        let Some((id, name)) = self.reloaded_online.nearest_remote(self.room.id, x, y, 24.0) else { return };
+        self.interaction_target = Some(id);
+        self.interaction_target_name = name;
+        self.interaction_menu_selection = 0;
+        self.interaction_menu_open = true;
+        self.interaction_menu_just_opened = true;
+    }
+
+    fn interaction_input(&mut self) {
+        if self.interaction_menu_just_opened {
+            self.interaction_menu_just_opened = false;
+            return
+        }
+        if self.interaction_request.is_some() {
+            let mut selection = self.interaction_menu_selection.min(1);
+            let mut activate = false;
+            if self.input.keyboard_check_pressed(input::Button::LeftArrow as u8)
+                || self.input.keyboard_check_pressed(input::Button::UpArrow as u8)
+            {
+                selection = 0;
+            }
+            if self.input.keyboard_check_pressed(input::Button::RightArrow as u8)
+                || self.input.keyboard_check_pressed(input::Button::DownArrow as u8)
+            {
+                selection = 1;
+            }
+            if self.input.keyboard_check_pressed(input::Button::Return as u8)
+                || self.input.keyboard_check_pressed(input::Button::Space as u8)
+            {
+                activate = true;
+            }
+            if self.input.keyboard_check_pressed(input::Button::Escape as u8) {
+                selection = 1;
+                activate = true;
+            }
+            if self.input.mouse_check_button_pressed(1) {
+                let (x, y) = (self.input.mouse_x(), self.input.mouse_y());
+                let (x1, y1, x2, y2) = self.interaction_row(2);
+                if x >= x1 && x <= x2 && y >= y1 && y <= y2 {
+                    selection = 0;
+                    activate = true;
+                }
+                let (x1, y1, x2, y2) = self.interaction_row(3);
+                if x >= x1 && x <= x2 && y >= y1 && y <= y2 {
+                    selection = 1;
+                    activate = true;
+                }
+            }
+            self.interaction_menu_selection = selection;
+            if !activate {
+                return
+            }
+            if let Some((id, _name, kind, _)) = self.interaction_request.take() {
+                let accept = selection == 0;
+                self.reloaded_online.send_response(id, accept);
+                if accept && kind == "F" {
+                    if let Some(data) = self.battle_team_snapshot() {
+                        self.battle_pending = self.reloaded_online.send_battle_team(id, &data);
+                        self.battle_target = Some(id);
+                        eprintln!("[battle] equipo enviado; esperando equipo remoto");
+                    }
+                }
+            }
+            return
+        }
+        if self.interaction_response.is_some() {
+            let close = self.input.keyboard_check_pressed_any()
+                || self.input.mouse_check_button_pressed_any();
+            if close {
+                self.interaction_response = None;
+            }
+            return
+        }
+        if !self.interaction_menu_open {
+            return
+        }
+        let mut selection = self.interaction_menu_selection.min(3);
+        let mut activate = false;
+        if self.input.keyboard_check_pressed(input::Button::UpArrow as u8) {
+            selection = (selection + 3) % 4;
+        }
+        if self.input.keyboard_check_pressed(input::Button::DownArrow as u8) {
+            selection = (selection + 1) % 4;
+        }
+        if self.input.keyboard_check_pressed(input::Button::Return as u8)
+            || self.input.keyboard_check_pressed(input::Button::Space as u8)
+        {
+            activate = true;
+        }
+        if self.input.keyboard_check_pressed(input::Button::Escape as u8) {
+            selection = 3;
+            activate = true;
+        }
+        if self.input.mouse_check_button_pressed(1) {
+            let (x, y) = (self.input.mouse_x(), self.input.mouse_y());
+            for index in 0..4 {
+                let (x1, y1, x2, y2) = self.interaction_row(index);
+                if x >= x1 && x <= x2 && y >= y1 && y <= y2 {
+                    selection = index;
+                    activate = true;
+                    break
+                }
+            }
+        }
+        self.interaction_menu_selection = selection;
+        if !activate {
+            return
+        }
+        if selection == 3 {
+            self.interaction_menu_open = false;
+            self.interaction_target = None;
+            return
+        }
+        let kind = match selection {
+            0 => "F",
+            1 => "T",
+            _ => "G",
+        };
+        if let Some(target) = self.interaction_target {
+            self.interaction_pending_kind = Some(kind.to_string());
+            let sent = self.reloaded_online.send_request(target, kind);
+            if !sent {
+                self.interaction_pending_kind = None;
+                self.interaction_response = Some(("No se pudo enviar la solicitud.".into(), false));
+            }
+        }
+        self.interaction_menu_open = false;
+        self.interaction_target = None;
+    }
+
     pub fn process_window_events(&mut self) {
         self.input.mouse_step();
+        // What the system keyboard typed becomes events in the same queue the window is about to
+        // drain, so the game sees it exactly as if it came from a hardware keyboard.
+        #[cfg(target_os = "android")]
+        crate::android_main::ime_pump();
+        // The keyboard coming or going moves the picture, and the game does not redraw on its own
+        // while it waits inside a text dialog, so the frame already drawn is presented again.
+        #[cfg(target_os = "android")]
+        self.represent_if_ime_moved();
         self.window.poll_events();
         // Apply releases a previous poll deferred, then snapshot the held state so a press and
         // its release landing in the SAME poll still leaves the button "held" for this poll
@@ -2157,7 +3461,21 @@ impl Game {
             PlayType::Normal => {
                 for event in self.window.events().into_iter().copied() {
                     match event {
-                        Event::KeyboardDown(key) => self.input.button_press(input::ramen2vk(key), true),
+                        Event::KeyboardDown(key) => {
+                            let vk = input::ramen2vk(key);
+                            self.input.button_press(vk, true);
+                            // Game Maker's `keyboard_string` drops its last character on backspace.
+                            // The game's text dialog relies on that instead of handling the key
+                            // itself, so the edit has to happen here.
+                            if vk == input::Button::Backspace as u8 {
+                                let source = self.keyboard_string.as_ref();
+                                // A character is appended as its UTF-8 bytes, so a multi-byte one
+                                // has to leave in one piece: cut at the last leading byte.
+                                let cut = source.iter().rposition(|b| b & 0xC0 != 0x80).unwrap_or(0);
+                                let shortened = gml::String::from(&source[..cut]);
+                                self.keyboard_string = shortened;
+                            }
+                        },
                         Event::KeyboardUp(key) => {
                             let vk = input::ramen2vk(key);
                             if was_held(vk) {
@@ -2317,60 +3635,332 @@ impl Game {
 
     // Plays the game normally
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let game_directory = self.decode_str(self.program_directory.as_ref()).into_owned();
+        crate::mods::prepare(&game_directory);
+        self.apply_visual_settings(std::path::Path::new(&game_directory));
         self.init()?;
         handle_scene_change!(self);
 
+        // The launcher pins this through `video.conf`; a desktop user can set `OPENGMK_RENDER`.
+        // Read it here because the launcher and the engine share one process.
+        self.render_mode = crate::render::pinned_render_mode();
+        match self.render_mode {
+            RenderMode::Auto => self.renderer.set_vsync(true),
+            RenderMode::Fixed(_) | RenderMode::Uncapped => self.renderer.set_vsync(false),
+            RenderMode::Native => (),
+        }
+        // Auto normally lets vsync pace the screen. If the driver ignores the swap interval, the
+        // launcher's detected rate is used as an explicit ceiling.
+        let paced_fps = match self.render_mode {
+            RenderMode::Fixed(fps) => Some(fps),
+            RenderMode::Auto => crate::render::pinned_render_hz(),
+            _ => None,
+        };
+        self.show_fps = std::env::var("OPENGMK_SHOW_FPS").map(|value| value != "0").unwrap_or(false);
+        self.render_fps = self.room.speed;
+        self.prev_views = Some(self.room.views.clone());
+
         let mut time_now = Instant::now();
         let mut time_last = time_now;
+        let mut step_clock = time_now;
+        let mut accumulator = Duration::ZERO;
         let mut current_frame_time: u32 = 0;
+        let mut render_frames: u32 = 0;
+        let mut step_frames: u32 = 0;
+        let mut last_render_report = time_now;
+        let mut next_present = time_now;
+        let log_render = std::env::var_os("OPENGMK_RENDER_LOG").is_some();
         loop {
-            self.process_window_events();
-
-            // The room goes with the error: the error alone names a function, not where it was
-            // called from, and with 34388 files and hundreds of scripts that is not enough to find
-            // anything. This is what turns a report into something that can be chased.
-            if let Err(e) = self.frame() {
-                println!("Runtime error: {} (room {})", e, self.room.id);
-                return Err(e.into())
-            }
-
-            self.capture_recording_frame(&mut current_frame_time, self.room.speed);
-            if let Some(SceneChange::End) = self.scene_change {
-                println!("game ending");
-                if let Some(recorder) = self.ffmpeg_recorder.take() {
-                    self.stop_recording_capture(recorder);
-                }
-            }
-            handle_scene_change!(self);
-
-            // Exit if the window was closed by the user, such as by pressing 'X'
-            if self.close_requested {
+            #[cfg(target_os = "android")]
+            if crate::android_main::worker_stop_requested() {
+                self.close_requested = true;
                 break Ok(self.run_game_end_events()?);
             }
+            self.process_window_events();
 
-            // frame limiter
-            let diff = Instant::now().duration_since(time_now);
-            let duration = Duration::from_nanos(1_000_000_000 / self.room.speed as u64);
-            if let GameClock::SpoofedNanos(t) = &mut self.clock {
-                *t += duration.as_nanos();
-                self.fps = self.room.speed.into();
-            } else {
-                // gm8 just ignores any leftover time after a second has passed, so we do the same
-                if time_now.duration_since(time_last) >= Duration::from_secs(1) {
-                    time_last = time_now;
-                    self.fps = self.frame_counter;
-                    self.frame_counter = 0;
+            // Test-only savestate hotkeys for the netplay determinism check.
+            #[cfg(not(target_os = "android"))]
+            {
+                if self.input.keyboard_check_pressed(input::Button::F9 as u8) {
+                    let state = crate::game::savestate::SaveState::from(
+                        self,
+                        crate::game::Replay::new(0, 0),
+                        self.renderer.state(),
+                        false,
+                    );
+                    let mut buffer = crate::game::savestate::Buffer::new();
+                    match state.save_to_file(&std::path::PathBuf::from("/tmp/gm8-state.bin"), &mut buffer) {
+                        Ok(()) => eprintln!("[savestate] F9 guardado"),
+                        Err(err) => eprintln!("[savestate] F9 error: {:?}", err),
+                    }
+                }
+                if self.input.keyboard_check_pressed(input::Button::F10 as u8) {
+                    let mut buffer = crate::game::savestate::Buffer::new();
+                    match crate::game::savestate::SaveState::from_file(
+                        &std::path::PathBuf::from("/tmp/gm8-state.bin"),
+                        &mut buffer,
+                    ) {
+                        Ok(state) => {
+                            let (_replay, renderer_state) = state.load_into(self);
+                            self.renderer.set_state(&renderer_state);
+                            eprintln!("[savestate] F10 cargado");
+                        },
+                        Err(err) => eprintln!("[savestate] F10 error: {:?}", err),
+                    }
                 }
             }
-            self.frame_counter += 1;
 
-            if let (Some(time), true) = (duration.checked_sub(diff), self.frame_limiter) {
-                gml::datetime::sleep(time);
-                time_now += duration;
+            if self.render_mode.interpolates() {
+                let now = Instant::now();
+                // While Android has no surface (app in the background) do not accumulate wall time:
+                // otherwise the game would fast-forward to catch up when the window comes back.
+                #[cfg(target_os = "android")]
+                if !crate::render::opengl::egl::has_surface() {
+                    step_clock = now;
+                    accumulator = Duration::ZERO;
+                    std::thread::sleep(Duration::from_millis(16));
+                    continue
+                }
+                accumulator += now.duration_since(step_clock);
+                step_clock = now;
+                let duration = Duration::from_nanos(1_000_000_000 / self.room.speed as u64);
+
+                // Transitions, a GML `sleep` and a very heavy battle frame can pause the loop. Do
+                // not replay that missing time as a burst of steps: the original runner simply
+                // resumes. Small overshoots are kept so the 30 Hz average stays correct.
+                if accumulator > duration * 3 {
+                    if log_render {
+                        eprintln!("[render] pausa de {:?}; se descarta el atraso", accumulator);
+                    }
+                    accumulator = duration;
+                }
+
+                if accumulator >= duration {
+                    // This is the canonical frame of the step: draw events run once and are allowed
+                    // to change the game. It is presented at the previous position so the next
+                    // frames can move smoothly towards the state just computed.
+                    self.interp_alpha = 0.0;
+                    self.interp_draw = false;
+                    self.interp_update_views = true;
+
+                    // The room goes with the error: the error alone names a function, not where it
+                    // was called from, and with 34388 files and hundreds of scripts that is not
+                    // enough to find anything.
+                    if let Err(e) = self.frame() {
+                        println!("Runtime error: {} (room {})", e, self.room.id);
+                        return Err(e.into())
+                    }
+
+                    accumulator -= duration;
+                    self.capture_recording_frame(&mut current_frame_time, self.room.speed);
+                    if let Some(SceneChange::End) = self.scene_change {
+                        println!("game ending");
+                        if let Some(recorder) = self.ffmpeg_recorder.take() {
+                            self.stop_recording_capture(recorder);
+                        }
+                    }
+                    // A room change invalidates the previous camera and the previous instances.
+                    let scene_changed = self.scene_change.is_some();
+                    if scene_changed {
+                        self.prev_views = None;
+                        // The new room's first draw is not an interpolation gap: persistent instances
+                        // still carry positions from the old room, so show the state as it is.
+                        self.interp_alpha = 1.0;
+                    }
+                    handle_scene_change!(self);
+                    if scene_changed {
+                        self.prev_views = Some(self.room.views.clone());
+                    }
+
+                    // Exit if the window was closed by the user, such as by pressing 'X'
+                    if self.close_requested {
+                        break Ok(self.run_game_end_events()?);
+                    }
+
+                    if let GameClock::SpoofedNanos(t) = &mut self.clock {
+                        *t += duration.as_nanos();
+                        self.fps = self.room.speed.into();
+                    } else {
+                        // gm8 just ignores any leftover time after a second has passed, so we do the same
+                        if step_clock.duration_since(time_last) >= Duration::from_secs(1) {
+                            time_last = step_clock;
+                            self.fps = self.frame_counter;
+                            self.frame_counter = 0;
+                        }
+                    }
+                    self.frame_counter += 1;
+                    step_frames += 1;
+                } else {
+                    // A frame between two game steps. Draw events still run, but state-changing
+                    // functions are suppressed inside `render_only`.
+                    self.interp_alpha =
+                        (accumulator.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0);
+                    self.interp_draw = true;
+                    self.interp_update_views = false;
+                    if let Err(e) = self.render_only() {
+                        println!("Runtime error: {} (room {})", e, self.room.id);
+                        return Err(e.into())
+                    }
+                }
+                // Native lets vsync/uncapped set the pace; Fixed does it explicitly, for drivers
+                // where eglSwapInterval/glXSwapIntervalEXT answers success but never blocks.
+                if let Some(fps) = paced_fps {
+                    let frame = Duration::from_nanos(1_000_000_000 / fps.max(1) as u64);
+                    next_present += frame;
+                    let now = Instant::now();
+                    if next_present > now {
+                        std::thread::sleep(next_present - now);
+                    } else {
+                        next_present = now;
+                    }
+                }
+                render_frames += 1;
+                if last_render_report.elapsed() >= Duration::from_secs(1) {
+                    self.render_fps = render_frames;
+                    if log_render {
+                        eprintln!(
+                            "[render] {} dibujos/s ({} pasos/s, room {})",
+                            render_frames, step_frames, self.room.speed
+                        );
+                    }
+                    render_frames = 0;
+                    step_frames = 0;
+                    last_render_report = Instant::now();
+                }
             } else {
-                time_now = Instant::now();
+                self.interp_alpha = 1.0;
+                self.interp_draw = false;
+                self.interp_update_views = true;
+
+                // The room goes with the error: the error alone names a function, not where it was
+                // called from, and with 34388 files and hundreds of scripts that is not enough to
+                // find anything. This is what turns a report into something that can be chased.
+                if let Err(e) = self.frame() {
+                    println!("Runtime error: {} (room {})", e, self.room.id);
+                    return Err(e.into())
+                }
+
+                self.capture_recording_frame(&mut current_frame_time, self.room.speed);
+                if let Some(SceneChange::End) = self.scene_change {
+                    println!("game ending");
+                    if let Some(recorder) = self.ffmpeg_recorder.take() {
+                        self.stop_recording_capture(recorder);
+                    }
+                }
+                handle_scene_change!(self);
+
+                // Exit if the window was closed by the user, such as by pressing 'X'
+                if self.close_requested {
+                    break Ok(self.run_game_end_events()?);
+                }
+
+                // frame limiter
+                let diff = Instant::now().duration_since(time_now);
+                let duration = Duration::from_nanos(1_000_000_000 / self.room.speed as u64);
+                if let GameClock::SpoofedNanos(t) = &mut self.clock {
+                    *t += duration.as_nanos();
+                    self.fps = self.room.speed.into();
+                } else {
+                    // gm8 just ignores any leftover time after a second has passed, so we do the same
+                    if time_now.duration_since(time_last) >= Duration::from_secs(1) {
+                        time_last = time_now;
+                        self.fps = self.frame_counter;
+                        self.frame_counter = 0;
+                    }
+                }
+                self.frame_counter += 1;
+                step_frames += 1;
+
+                if let (Some(time), true) = (duration.checked_sub(diff), self.frame_limiter) {
+                    gml::datetime::sleep(time);
+                    time_now += duration;
+                } else {
+                    time_now = Instant::now();
+                }
+
+                render_frames += 1;
+                if last_render_report.elapsed() >= Duration::from_secs(1) {
+                    self.render_fps = render_frames;
+                    if log_render {
+                        eprintln!(
+                            "[render] {} dibujos/s ({} pasos/s, room {})",
+                            render_frames, step_frames, self.room.speed
+                        );
+                    }
+                    render_frames = 0;
+                    step_frames = 0;
+                    last_render_report = Instant::now();
+                }
             }
         }
+    }
+
+    /// Draws one frame between two game steps. It runs the game's draw events with the same state
+    /// the step left behind, so visuals that depend on it (menus, checks for nearby instances) keep
+    /// working, but anything that could alter the simulation is suppressed and the few pieces of
+    /// state the draw path normally writes are restored afterwards.
+    fn render_only(&mut self) -> gml::Result<()> {
+        #[cfg(target_os = "android")]
+        let _frame = crate::render::opengl::egl::frame_guard();
+
+        #[cfg(target_os = "android")]
+        {
+            if crate::render::opengl::egl::context_lost() {
+                eprintln!("[gl] contexto perdido: terminando la sesion para reconstruir el renderer");
+                self.scene_change = Some(SceneChange::End);
+                return Ok(())
+            }
+            unsafe { crate::render::opengl::egl::bind_surface() };
+            if !crate::render::opengl::egl::has_surface() {
+                // There is nothing to draw to while the activity is in the background. Native mode
+                // already sleeps once per step; Uncapped would spin the CPU without this.
+                std::thread::sleep(Duration::from_millis(8));
+                return Ok(())
+            }
+        }
+
+        if self.close_requested {
+            return Ok(())
+        }
+
+        if !self.auto_draw || self.scene_change.is_some() {
+            std::thread::sleep(Duration::from_millis(4));
+            return Ok(())
+        }
+
+        let rand = self.rand.clone();
+        let render_state = self.renderer.draw_state();
+        let draw_font_id = self.draw_font_id;
+        let draw_colour = self.draw_colour;
+        let draw_alpha = self.draw_alpha;
+        let draw_halign = self.draw_halign;
+        let draw_valign = self.draw_valign;
+        let scene_change = self.scene_change.clone();
+        let views = self.room.views.clone();
+        let view_current = self.view_current;
+
+        self.interp_draw = true;
+        self.interp_update_views = false;
+        let result = self.draw();
+
+        self.interp_draw = false;
+        self.rand = rand;
+        self.renderer.restore_draw_state(&render_state);
+        self.draw_font_id = draw_font_id;
+        self.draw_colour = draw_colour;
+        self.draw_alpha = draw_alpha;
+        self.draw_halign = draw_halign;
+        self.draw_valign = draw_valign;
+        self.scene_change = scene_change;
+        self.room.views = views;
+        self.view_current = view_current;
+
+        result?;
+
+        if self.scene_change.is_none() && self.play_type != PlayType::Record {
+            self.renderer.present(self.window_inner_size.0, self.window_inner_size.1, self.scaling);
+        }
+        Ok(())
     }
 
     fn capture_recording_frame(&mut self, current_frame_time: &mut u32, game_speed: u32) {
@@ -2723,6 +4313,23 @@ impl Game {
                 Some(c) => c,
                 None => return false,
             };
+
+            // An empty frame is "no collision" only when the map is real-sized: the open gate
+            // frames are 48x32 / 8x43. The battle `.gmspr` sprites also carry all-false masks, but
+            // as 1x1/0x0 placeholders; those must fall through to the bbox fallback in
+            // `check_collision_point_precise`, or Vuelo/Bote never land (regression in 0.3.8).
+            let empty_real_frame = |per_frame: bool, collider: &crate::asset::sprite::Collider| {
+                per_frame
+                    && collider.width > 1
+                    && collider.height > 1
+                    && collider.data.len() > 1
+                    && collider.data.iter().all(|&px| !px)
+            };
+            if empty_real_frame(sprite1.per_frame_colliders, collider1)
+                || empty_real_frame(sprite2.per_frame_colliders, collider2)
+            {
+                return false;
+            }
 
             // round x and y values, and get sin and cos of each angle...
             let x1 = inst1.x.get().round();
